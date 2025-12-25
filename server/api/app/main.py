@@ -879,6 +879,10 @@ def governance_rules_current():
         "rules": GMF_GOV["rules"],
         "sigset": GMF_GOV["sigset"],
         "guardian_set": GMF_GOV["guardian_set"],
+                "rules_registry_path": GMF_GOV.get("rules_registry_path", "governance/rules/registry.json"),
+                "rules_registry": __import__("json").load(open(GMF_GOV.get("rules_registry_path", "governance/rules/registry.json"), "r", encoding="utf-8")),
+                "rules_amendments_dir": __import__("os").environ.get("GMF_RULES_AMENDMENTS_DIR", "governance/rules/amendments"),
+
                 "registry": GMF_GOV.get("registry", {}),
                 "transitions_dir": "governance/signers/transitions",
                 "attestations_dir": "ledger/attestations",
@@ -1039,6 +1043,10 @@ def ledger_receipt_proof_bundle(receipt_id: str):
                 "rules": GMF_GOV["rules"],
                 "sigset": GMF_GOV["sigset"],
                 "guardian_set": GMF_GOV["guardian_set"],
+                "rules_registry_path": GMF_GOV.get("rules_registry_path", "governance/rules/registry.json"),
+                "rules_registry": __import__("json").load(open(GMF_GOV.get("rules_registry_path", "governance/rules/registry.json"), "r", encoding="utf-8")),
+                "rules_amendments_dir": __import__("os").environ.get("GMF_RULES_AMENDMENTS_DIR", "governance/rules/amendments"),
+
                 "registry": GMF_GOV.get("registry", {}),
                 "transitions_dir": "governance/signers/transitions",
                 "attestations_dir": "ledger/attestations",
@@ -1173,3 +1181,27 @@ def governance_rules_amendments_submit(amendment: dict):
     """
     res = amendments.apply_amendment(amendment)
     return {"ok": True, **res}
+
+
+@app.get("/governance/rules/amendments/list")
+def governance_rules_amendments_list(limit: int = 50):
+    import os, json
+    d = os.environ.get("GMF_RULES_AMENDMENTS_DIR", "governance/rules/amendments")
+    try:
+        files = [fn for fn in os.listdir(d) if fn.endswith(".json")]
+        files.sort()
+        files = files[-max(1, min(500, int(limit))):]
+        return {"ok": True, "dir": d, "files": files}
+    except Exception as e:
+        return {"ok": False, "error": "failed_to_list", "dir": d, "detail": str(e)}
+
+@app.get("/governance/rules/amendments/get")
+def governance_rules_amendments_get(name: str):
+    import os, json
+    d = os.environ.get("GMF_RULES_AMENDMENTS_DIR", "governance/rules/amendments")
+    path = os.path.join(d, name)
+    try:
+        obj = json.load(open(path, "r", encoding="utf-8"))
+        return {"ok": True, "path": path, "amendment": obj}
+    except Exception as e:
+        return {"ok": False, "error": "failed_to_load", "path": path, "detail": str(e)}
