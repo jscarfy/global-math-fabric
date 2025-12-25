@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'gmf/ios_bg_channel.dart';
 import 'gmf/settings_page.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
@@ -45,6 +46,7 @@ void callbackDispatcher() {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  IosBgChannel.ensureInstalled();
   Workmanager().initialize(callbackDispatcher, isInDebugMode: false);
   runApp(const App());
 }
