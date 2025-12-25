@@ -48,6 +48,16 @@ PY
 
           ./scripts/ledger/make_settlement.sh "$DATE" "$LEDGER_SERVER_SK_B64" "$PREV_ROOT"
 
+
+      - name: Publish SSR log to Pages (public)
+        run: |
+          DATE="${{ steps.d.outputs.date }}"
+          IN="ledger/inbox/${DATE}.ssr.jsonl"
+          if [ -f "$IN" ]; then
+            mkdir -p releases/ledger/ssr
+            cp -f "$IN" "releases/ledger/ssr/${DATE}.jsonl"
+          fi
+
       - name: Commit settlement back to main
         run: |
           git config user.name "gmf-bot"
