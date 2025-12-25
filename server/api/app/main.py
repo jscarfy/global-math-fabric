@@ -27,6 +27,7 @@ from app.crypto import ledger as ledger_mod
 from app.crypto import checkpointing
 from app.work.routes import router as work_router
 from app.credits import router as credits_router
+from app.enroll import router as enroll_router
 from app.crypto import amendments
 from app.crypto import merkle as merkle_mod
 from app.schemas.receipt import ReceiptEnvelope
@@ -1214,3 +1215,6 @@ app.include_router(work_router)
 
 # Credits API
 app.include_router(credits_router)
+
+# Enroll API
+app.include_router(enroll_router)

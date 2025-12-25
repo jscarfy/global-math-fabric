@@ -2,6 +2,7 @@ import os, json, uuid, hashlib, datetime, base64
 from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import Session
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from app.enroll import verify as verify_enroll
 from sqlalchemy import and_
 from .db.work_db import SessionWork
 from .db.models import Job, JobLease, WorkResult, Device, DeviceDaily
@@ -248,8 +249,11 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict, device_
         # mint receipt only if accepted
         if ok:
             gov = load_governance_or_die()
+            d = _device_get_or_create(db, device_id)
             payload_obj = {
                 "type": "work_receipt",
+                "enroll_ref": d.enroll_ref,
+                "policy_version": d.policy_version,
                 "receipt_id": str(uuid.uuid4()),
                 "job_id": job_id,
                 "device_id": device_id,
@@ -290,7 +294,7 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict, device_
 
 
 @router.post("/devices/register")
-def device_register(device_id: str, platform: str = "unknown", has_lean: bool = False, ram_mb: int = 0, disk_mb: int = 0, topics: str = "", pubkey_b64: str = "", meta: dict | None = None):
+def device_register(device_id: str, platform: str = "unknown", has_lean: bool = False, ram_mb: int = 0, disk_mb: int = 0, topics: str = "", pubkey_b64: str = "", enroll_token: str = "", meta: dict | None = None):
     """
     Device announces capabilities + preferred topics.
     topics: csv, e.g. "algebra,nt,topology"
@@ -302,6 +306,16 @@ def device_register(device_id: str, platform: str = "unknown", has_lean: bool = 
         d.has_lean = bool(has_lean)
         d.ram_mb = int(ram_mb)
         d.disk_mb = int(disk_mb)
+        # optional immutable enrollment token (binds long-term rules)
+        if enroll_token.strip():
+            pay = verify_enroll(enroll_token.strip())
+            # enforce topics from token if present
+            tok_topics = (pay.get("topics") or "")
+            if tok_topics:
+                topics = tok_topics
+            d.policy_version = str(pay.get("policy_version") or "v1")
+            d.daily_credit_limit = int(pay.get("daily_credit_limit") or 0)
+            d.enroll_ref = _sha256_hex(enroll_token.strip())
         d.topics_csv = _csv_norm(topics)
         if pubkey_b64.strip():
             d.pubkey_b64 = pubkey_b64.strip()

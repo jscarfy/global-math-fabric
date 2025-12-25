@@ -53,6 +53,9 @@ class Device(BaseWork):
     disk_mb = Column(Integer, nullable=False, default=0)
     topics_csv = Column(Text, nullable=True)                       # e.g. "algebra,nt,topology"
     pubkey_b64 = Column(Text, nullable=True)                       # device ed25519 public key (base64, 32 bytes)
+    enroll_ref = Column(Text, nullable=True, index=True)           # sha256(token) to bind receipts forever
+    policy_version = Column(String, nullable=True)                 # e.g. v1
+    daily_credit_limit = Column(Integer, nullable=False, default=0) # 0 => unlimited for this device
     meta_json = Column(Text, nullable=True)                        # canonical json string
     last_seen_at = Column(DateTime(timezone=True), server_default=func.now())
 
