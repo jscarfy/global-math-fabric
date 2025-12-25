@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "gmf_final_verify",
   "gmf_receipts",
   "gmf_ledger",
   "gmf_worker"
