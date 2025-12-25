@@ -1,30 +1,38 @@
 {
-  "version": 2,
+  "version": 3,
   "defaults": {
     "protocol": "gmf/task/v1",
     "replicas": 2,
-    "credit_micro_total": 2000000
+    "credit_micro_total": 2500000
   },
+
+  // 若 matrix_rows_file 存在，compile_tasks.py 會直接讀 rows（不做 Cartesian product）
+  "matrix_rows_file": "tasks/templates/matrix_rows.json",
+
+  // fallback（若你不用 discover）
   "matrix": {
-    "name": ["mathlib_demo"],
+    "name": ["manual_demo"],
     "git_url": ["https://github.com/leanprover-community/mathlib4.git"],
     "rev": ["master"],
     "subdir": [""],
-    "target_file": ["Mathlib/Algebra/Group/Basic.lean"]
+    "files_list_shell": ["'Mathlib/Algebra/Group/Basic.lean'"]
   },
+
   "tasks": [
     {
-      "task_id": "lean_${name}_${target_file}",
+      "task_id": "lean_batch_${name}_${shard_id}",
       "kind": "lean_check",
-      "credit_micro_total": 3000000,
+      "credit_micro_total": 2500000,
       "replicas": 2,
       "params": {
         "git_url": "${git_url}",
         "rev": "${rev}",
         "subdir": "${subdir}",
 
-        "cmd": ["lake","env","lean","${target_file}"],
-        "target_file": "${target_file}",
+        "cmd": [
+          "bash","-lc",
+          "set -euo pipefail; for f in ${files_list_shell}; do echo \"[lean] $f\"; lake env lean \"$f\"; done"
+        ],
 
         "use_mathlib_cache": true,
         "artifacts_root": ".lake/build/lib",
@@ -33,7 +41,10 @@
         "require_source_hash": true,
 
         "docker_image": "leanprovercommunity/lean@sha256:REPLACE_ME",
-        "require_digest": true
+        "require_digest": true,
+
+        // anti-dup 的 work_unit_id 由 compile_tasks.py 自動算（基於 cmd/git/rev/subdir/docker_image/artifacts_root）
+        "allow_duplicate_work_unit": false
       }
     }
   ]
