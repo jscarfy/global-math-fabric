@@ -18,3 +18,8 @@ Compute a manifest file as:
 - artifacts_manifest_sha256 = sha256(manifest_bytes)
 
 This is the "root hash" of build outputs.
+
+## Docker image pin rule (REQUIRED)
+- docker_image MUST contain "@sha256:" (digest pin), e.g.
+  "leanprovercommunity/lean@sha256:...."
+- Tag-only images (":latest", ":vX.Y") are NOT allowed for long-horizon auditability.
