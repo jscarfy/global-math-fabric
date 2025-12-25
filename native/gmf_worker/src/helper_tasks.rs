@@ -4,6 +4,28 @@ use ed25519_dalek::{Signature, VerifyingKey, Verifier};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+
+const MAX_LEDGER_BYTES: usize = 25 * 1024 * 1024; // 25MB hard cap for mobile/helper
+const HTTP_TIMEOUT_SECS: u64 = 30;
+
+async fn fetch_limited(url: &str) -> Result<Vec<u8>> {
+    use std::time::Duration;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .build()?;
+    let resp = client.get(url).send().await?;
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_LEDGER_BYTES {
+            return Err(anyhow!("ledger too large: {} bytes", len));
+        }
+    }
+    let bytes = resp.bytes().await?;
+    if bytes.len() > MAX_LEDGER_BYTES {
+        return Err(anyhow!("ledger too large after download: {} bytes", bytes.len()));
+    }
+    Ok(bytes.to_vec())
+}
+
 fn jcs_canonicalize(v: &Value) -> Vec<u8> {
     // small canonicalizer: serde_json with sorted keys recursively
     fn sort(v: &Value) -> Value {
@@ -54,7 +76,7 @@ pub async fn run_receipt_verify(relay_base: &str, params: &Value) -> Result<Valu
         .unwrap_or(&format!("/v1/ledger/ssr/{date}"));
     let url = format!("{}{}", relay_base.trim_end_matches('/'), endpoint);
 
-    let bytes = reqwest::get(&url).await?.bytes().await?;
+    let bytes = fetch_limited(&url).await?;
     let digest = sha256_hex(&bytes);
 
     let text = String::from_utf8_lossy(&bytes);
@@ -107,7 +129,7 @@ pub async fn run_ledger_audit(relay_base: &str, params: &Value) -> Result<Value>
         .unwrap_or(&format!("/v1/ledger/ssr/{date}"));
     let url = format!("{}{}", relay_base.trim_end_matches('/'), endpoint);
 
-    let bytes = reqwest::get(&url).await?.bytes().await?;
+    let bytes = fetch_limited(&url).await?;
     let text = String::from_utf8_lossy(&bytes);
 
     let mut total = 0i64;
