@@ -1,3 +1,7 @@
+import hashlib
+import os
+import json
+from pathlib import Path
 import os, json, uuid, hashlib, datetime, base64
 from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import Session
@@ -336,3 +340,27 @@ def device_heartbeat(device_id: str):
         return {"ok": True, "device_id": device_id}
     finally:
         db.close()
+
+GMF_VERIFICATION_DIR = os.environ.get('GMF_VERIFICATION_DIR', 'ledger/verifications')
+
+
+def _canon_json_bytes(obj) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+def _sha256_hex_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def _verif_path_for_hash(h: str) -> Path:
+    h = h.lower()
+    d = Path(GMF_VERIFICATION_DIR) / h[:2]
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{h}.json"
+
+def _write_verification_record(rec: dict) -> str:
+    b = _canon_json_bytes(rec)
+    h = _sha256_hex_bytes(b)
+    p = _verif_path_for_hash(h)
+    if not p.exists():
+        p.write_bytes(b)
+    return h
+

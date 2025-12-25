@@ -28,6 +28,8 @@ from app.crypto import checkpointing
 from app.work.routes import router as work_router
 from app.credits import router as credits_router
 from app.enroll import router as enroll_router
+from app.policy import router as policy_router
+from app.verification import router as verification_router
 from app.crypto import amendments
 from app.crypto import merkle as merkle_mod
 from app.schemas.receipt import ReceiptEnvelope
@@ -1218,3 +1220,9 @@ app.include_router(credits_router)
 
 # Enroll API
 app.include_router(enroll_router)
+
+# Policy API
+app.include_router(policy_router)
+
+# Verification API
+app.include_router(verification_router)
