@@ -161,6 +161,11 @@ def pull_job(device_id: str, topics: str = ""):
         # policy hash binding: client must echo current policy_hash
         sub = submit_obj if 'submit_obj' in locals() else (submission if 'submission' in locals() else {})
         submitted_policy = sub.get('policy_hash')
+        submitted_sig_spec = (sub.get('sig_spec_hash') or '').strip().lower()
+        if not submitted_sig_spec:
+            accepted = False; reason = 'sig_spec_hash_missing'; awarded_credits = 0
+        elif submitted_sig_spec != str(GMF_SIG_SPEC_HASH).lower():
+            accepted = False; reason = 'sig_spec_hash_mismatch'; awarded_credits = 0
         # device signature verification (anti-credit-theft)
         device_sig_alg = (sub.get('device_sig_alg') or sub.get('sig_alg') or 'ed25519').strip().lower()
         device_sig_b64 = (sub.get('device_sig') or sub.get('sig') or '').strip()
@@ -185,7 +190,7 @@ def pull_job(device_id: str, topics: str = ""):
             'sample_indices': [int(x.get('idx')) for x in (sub.get('samples') or []) if isinstance(x, dict) and 'idx' in x],
             'output': sub.get('output'),
         }
-        sig_msg = _canon_sig_message(sig_msg_obj)
+        sig_msg = _sigmsg_v1_bytes(sig_msg_obj)
         # Enforce if required, or if device has pubkey on file
         if (GMF_REQUIRE_DEVICE_SIG or dev_pub):
             if not dev_pub:
@@ -796,3 +801,36 @@ def _verify_device_sig_ed25519(pubkey_hex: str, msg: bytes, sig_b64: str) -> boo
         return True
     except Exception:
         return False
+
+GMF_SIG_SPEC_PATH = os.environ.get('GMF_SIG_SPEC_PATH','ledger/policies/sig_spec_v1.md')
+
+def _load_sig_spec_hash() -> tuple[str,str]:
+    p = Path(GMF_SIG_SPEC_PATH)
+    name = p.name
+    try:
+        b = p.read_bytes()
+        return (hashlib.sha256(b).hexdigest(), name)
+    except Exception:
+        return (hashlib.sha256(f"MISSING:{GMF_SIG_SPEC_PATH}".encode("utf-8")).hexdigest(), name)
+
+GMF_SIG_SPEC_HASH, GMF_SIG_SPEC_NAME = _load_sig_spec_hash()
+
+def _sigmsg_v1_bytes(fields: dict) -> bytes:
+    # fixed order, key=value\n
+    keys = [
+        "device_id","lease_id","job_id","policy_hash","sig_spec_hash","challenge_nonce",
+        "bundle_format","header_sha256","merkle_root_hex","num_chunks","sample_indices","output_sha256"
+    ]
+    def val(k):
+        v = fields.get(k)
+        if v is None:
+            return ""
+        if k == "sample_indices":
+            if isinstance(v, list):
+                return ",".join(str(int(x)) for x in v)
+            return str(v)
+        return str(v)
+    lines = []
+    for k in keys:
+        lines.append(f"{k}={val(k)}\n")
+    return "".join(lines).encode("utf-8")
