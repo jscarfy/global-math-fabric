@@ -1115,3 +1115,23 @@ def ledger_checkpoint_pending_latest():
 def ledger_checkpoint_pending_list(limit: int = 20):
     files = checkpointing.list_pending_checkpoints(limit=int(limit))
     return {"ok": True, "limit": int(limit), "files": files}
+
+
+@app.get("/governance/guardian_sets")
+def governance_guardian_sets():
+    reg = GMF_GOV.get("registry", {}) or {}
+    return {"ok": True, "active_guardian_set_id": reg.get("active_guardian_set_id"), "sets": reg.get("sets", {})}
+
+@app.get("/governance/guardian_sets/{guardian_set_id}")
+def governance_guardian_set_get(guardian_set_id: str):
+    reg = GMF_GOV.get("registry", {}) or {}
+    sets = reg.get("sets", {}) or {}
+    if guardian_set_id not in sets:
+        return {"ok": False, "error": "unknown_guardian_set_id"}
+    path = str(sets[guardian_set_id])
+    try:
+        import json
+        g = json.load(open(path, "r", encoding="utf-8"))
+        return {"ok": True, "guardian_set_id": guardian_set_id, "path": path, "guardian_set": g}
+    except Exception:
+        return {"ok": False, "error": "failed_to_load_guardian_set", "path": path}

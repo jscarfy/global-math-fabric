@@ -1,0 +1,7 @@
+{
+  "active_guardian_set_id": "guardian_set_v1",
+  "sets": {
+    "guardian_set_v1": "governance/signers/guardian_set_v1.json",
+    "guardian_set_v2": "governance/signers/guardian_set_v2.json"
+  }
+}

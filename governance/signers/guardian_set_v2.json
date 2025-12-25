@@ -1,0 +1,11 @@
+{
+  "guardian_set_id": "guardian_set_v2",
+  "threshold": 3,
+  "signers": [
+    {"id":"guardian_set_v2:guardian-1","pub_pem":"governance/signers/guardian_set_v2/guardian-1.ed25519.pub.pem"},
+    {"id":"guardian_set_v2:guardian-2","pub_pem":"governance/signers/guardian_set_v2/guardian-2.ed25519.pub.pem"},
+    {"id":"guardian_set_v2:guardian-3","pub_pem":"governance/signers/guardian_set_v2/guardian-3.ed25519.pub.pem"},
+    {"id":"guardian_set_v2:guardian-4","pub_pem":"governance/signers/guardian_set_v2/guardian-4.ed25519.pub.pem"},
+    {"id":"guardian_set_v2:guardian-5","pub_pem":"governance/signers/guardian_set_v2/guardian-5.ed25519.pub.pem"}
+  ]
+}

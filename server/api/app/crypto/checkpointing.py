@@ -62,8 +62,10 @@ def current_ledger_root_and_len() -> Tuple[str, int]:
     return mc.root_for_n(n), n
 
 def guardian_set() -> Dict[str, Any]:
-    gset_path = os.environ.get("GMF_GUARDIAN_SET_PATH", "governance/signers/guardian_set_v1.json")
-    return load_json(gset_path)
+    # default set for NEW checkpoints is registry.active_guardian_set_id
+    reg = guardian_registry()
+    active = str(reg.get("active_guardian_set_id") or "guardian_set_v1")
+    return guardian_set_by_id(active)
 
 def verify_threshold_signatures_ed25519(msg: str, signatures: List[Dict[str, Any]], threshold: int, gset: Dict[str, Any]) -> Tuple[bool, int]:
     signer_map = {str(s["id"]): str(s["pub_pem"]) for s in gset.get("signers", [])}
@@ -117,7 +119,7 @@ def create_pending_checkpoint(rules_sha256: str) -> Dict[str, Any]:
 
 def accept_checkpoint(checkpoint: Dict[str, Any], rules_sha256_expected: str) -> Dict[str, Any]:
     ensure_dirs()
-    gset = guardian_set()
+    gset = guardian_set_by_id(str(checkpoint.get('guardian_set_id') or guardian_set().get('guardian_set_id')))
     thr = int(checkpoint.get("threshold") or gset.get("threshold") or 1)
 
     # basic checks
@@ -203,3 +205,15 @@ def latest_pending_checkpoint() -> Dict[str, Any] | None:
     path = os.path.join(pending_dir(), files[-1])
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def guardian_registry() -> Dict[str, Any]:
+    reg_path = os.environ.get("GMF_GUARDIAN_REGISTRY_PATH", "governance/signers/registry.json")
+    return load_json(reg_path)
+
+def guardian_set_by_id(gset_id: str) -> Dict[str, Any]:
+    reg = guardian_registry()
+    sets = reg.get("sets", {}) or {}
+    if gset_id not in sets:
+        raise ValueError(f"unknown guardian_set_id: {gset_id}")
+    return load_json(str(sets[gset_id]))
