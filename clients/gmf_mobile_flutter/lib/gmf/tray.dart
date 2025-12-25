@@ -38,3 +38,11 @@ class GMFTray with TrayListener {
     }
   }
 }
+
+class GMFTrayStatus {
+  static Future<void> set(String s) async {
+    try {
+      await TrayManager.instance.setToolTip('GMF: $s');
+    } catch (_) {}
+  }
+}
