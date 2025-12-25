@@ -338,6 +338,29 @@ async fn main() -> anyhow::Result<()> {
             "report_verify" => {
                 let rc = crate::helper_tasks::run_report_verify(&relay_base_url, &task.params).await?;
 
+                // report_audit receipt (best-effort) if ok
+                let ok2 = rc.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                if ok2 {
+                    let rk = rc.get("report_kind").and_then(|v| v.as_str()).unwrap_or("");
+                    let pid = rc.get("period_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let roll = rc.get("rollup_sha256").and_then(|v| v.as_str()).unwrap_or("");
+                    let payload2 = serde_json::json!({
+                        "report_kind": rk,
+                        "period_id": pid,
+                        "target_rollup_sha256": roll,
+                        "verifier_result_ok": true,
+                        "verifier_detail": rc
+                    });
+                    let body2 = serde_json::json!({
+                        "consent_token_json": consent_token_json,
+                        "device_pubkey_b64": device_pubkey_b64,
+                        "report_audit_payload": payload2
+                    });
+                    let url2 = format!("{}/v1/report_audit/receipt", relay_base_url.trim_end_matches('/'));
+                    let _ = reqwest::Client::new().post(&url2).json(&body2).send().await;
+                }
+
+
                 // meta-attest (best-effort) if ok
                 let do_meta = task.params.get("meta_attest").and_then(|v| v.as_bool()).unwrap_or(true);
                 if do_meta {
