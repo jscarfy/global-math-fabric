@@ -353,6 +353,12 @@ def report_instance(
 
     
     # --- issue receipt (offline verifiable) ---
+    manifest = {}
+    try:
+        td2 = db.query(TaskDef).filter(TaskDef.id == getattr(inst, 'task_id_fk', None)).first()
+        manifest = td2.manifest if td2 else {}
+    except Exception:
+        manifest = {}
     receipt_payload = {
         "v": 1,
         "issued_at": now_iso(),
@@ -365,7 +371,15 @@ def report_instance(
         "stdout_sha256": str(req.stdout_sha256),
         # optional proof summary (client/server already computed)
         "work_proof": (req.stdout_json or {}).get("_work_proof", None),
+        "task_manifest_hash": (hashlib.sha256(
+            json.dumps((manifest if isinstance(manifest, dict) else {}), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()),
+        "pricing_breakdown": (getattr(inst, "pricing_breakdown", None) or {}),
     }
+        # deterministic receipt_id for indexing
+    receipt_payload["receipt_id"] = hashlib.sha256(
+        json.dumps(receipt_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
     key_id, sig_b64, payload_b64 = sign_receipt(receipt_payload)
     receipt_env = ReceiptEnvelope(key_id=key_id, payload_b64=payload_b64, signature_b64=sig_b64)
     # -----------------------------------------
@@ -745,3 +759,103 @@ def compute_awarded_credits(manifest: dict, risk_score: float, antifarm_count: i
 
     final = int(math.floor(min(cap, max(0, credits)) * risk_mult * farm_mult))
     return max(0, min(cap, final))
+
+
+def compute_awarded_credits_and_breakdown(manifest: dict, risk_score: float, antifarm_count: int) -> tuple[int, dict]:
+    base_light = _env_int("GMF_CREDITS_BASE_LIGHT", 1)
+    base_heavy = _env_int("GMF_CREDITS_BASE_HEAVY", 5)
+    cap = _env_int("GMF_CREDITS_MAX_PER_INSTANCE", 200)
+
+    pp = (manifest.get("power_profile") or "light").lower()
+    base = base_heavy if pp == "heavy" else base_light
+
+    addon = 0
+    kind = None
+    iters = 0
+    rate_per_1m = 0.0
+
+    if pp == "heavy":
+        hw = manifest.get("heavy_work") or {}
+        kind = (hw.get("kind") or "sha256_chain").lower()
+        iters = int(hw.get("iters") or 0)
+
+        if kind in ("sha256_chain", "sha256"):
+            rate_per_1m = _env_float("GMF_CREDITS_RATE_SHA256_PER_1M", 1.0)
+        elif kind in ("poly_mod", "polymod"):
+            rate_per_1m = _env_float("GMF_CREDITS_RATE_POLYMOD_PER_1M", 1.5)
+        else:
+            rate_per_1m = _env_float("GMF_CREDITS_RATE_SHA256_PER_1M", 1.0) * 0.5
+
+        addon = int(round((iters / 1_000_000.0) * rate_per_1m))
+
+    raw = base + addon
+
+    # risk penalty
+    pen = _env_float("GMF_RISK_CREDIT_PENALTY_PER_100", 0.5)
+    risk_mult = max(0.0, 1.0 - (max(0.0, float(risk_score)) / 100.0) * pen)
+
+    # anti-farm
+    thr = _env_int("GMF_ANTIFARM_THRESHOLD", 50)
+    decay = _env_float("GMF_ANTIFARM_DECAY_PER_EXTRA", 0.01)
+    min_mult = _env_float("GMF_ANTIFARM_MIN_MULT", 0.2)
+
+    if int(antifarm_count) > thr:
+        extra = int(antifarm_count) - thr
+        farm_mult = max(min_mult, 1.0 - extra * decay)
+    else:
+        farm_mult = 1.0
+
+    capped = min(cap, max(0, raw))
+    final = int(math.floor(capped * risk_mult * farm_mult))
+    final = max(0, min(cap, final))
+
+    breakdown = {
+        "power_profile": pp,
+        "base": int(base),
+        "addon": int(addon),
+        "heavy_kind": kind,
+        "heavy_iters": int(iters),
+        "rate_per_1m": float(rate_per_1m),
+        "raw": int(raw),
+        "cap": int(cap),
+        "capped": int(capped),
+        "risk_score": float(risk_score),
+        "risk_penalty_per_100": float(pen),
+        "risk_mult": float(risk_mult),
+        "antifarm_count": int(antifarm_count),
+        "antifarm_threshold": int(thr),
+        "antifarm_decay_per_extra": float(decay),
+        "antifarm_min_mult": float(min_mult),
+        "farm_mult": float(farm_mult),
+        "final": int(final),
+    }
+    return final, breakdown
+
+
+
+@app.post("/receipts/verify")
+def verify_receipt_endpoint(env: ReceiptEnvelope):
+    """
+    Verify a receipt envelope and (optionally) return decoded payload for display.
+    Uses GMF_RECEIPT_PUBLIC_PEM (default keys/receipt-dev.ed25519.pub.pem).
+    """
+    pub_pem = os.environ.get("GMF_RECEIPT_PUBLIC_PEM", "keys/receipt-dev.ed25519.pub.pem")
+    ok = verify_receipt(env.payload_b64, env.signature_b64, pub_pem)
+    payload = None
+    if ok:
+        try:
+            import base64, json as _json, hashlib as _hashlib
+            msg = base64.b64decode(env.payload_b64.encode("ascii"))
+            payload = _json.loads(msg.decode("utf-8"))
+            # optional: recompute receipt_id consistency
+            rid = payload.get("receipt_id")
+            if rid:
+                recomputed = _hashlib.sha256(
+                    _json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                ).hexdigest()
+                if recomputed != rid:
+                    ok = False
+        except Exception:
+            # keep ok as-is, but no payload
+            payload = None
+    return {"ok": ok, "key_id": env.key_id, "payload": payload}
