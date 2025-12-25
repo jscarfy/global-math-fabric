@@ -76,6 +76,18 @@ struct Submission {
 }
 
 #[derive(Clone)]
+
+#[derive(Debug, Deserialize)]
+struct LedgerSsrQuery {
+    offset_lines: Option<usize>,
+    max_lines: Option<usize>,
+}
+
+fn clamp_max_lines(x: usize) -> usize {
+    // hard cap to prevent abuse; tune as needed
+    x.min(50_000).max(1)
+}
+
 struct AppState {
     tasks: Arc<Mutex<Vec<TaskSpec>>>,
     assigned: Arc<Mutex<HashMap<String, Lease>>>,      // lease_key "{task_id}::{device_id}"
@@ -661,20 +673,70 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
 }
 
 
-async fn ledger_ssr(axum::extract::Path(date): axum::extract::Path<String>)
--> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
-    // Strict date whitelist-ish
+
+async fn ledger_ssr(
+    axum::extract::Path(date): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LedgerSsrQuery>
+) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, Vec<u8>), (axum::http::StatusCode, String)> {
+    // Strict date
     if date.len() != 10 || &date[4..5] != "-" || &date[7..8] != "-" {
         return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into()));
     }
+
     let path = PathBuf::from("ledger/inbox").join(format!("{date}.ssr.jsonl"));
     if !path.exists() {
         return Err((axum::http::StatusCode::NOT_FOUND, "no such ledger day".into()));
     }
-    let bytes = std::fs::read(&path).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let body = String::from_utf8_lossy(&bytes).to_string();
-    Ok((axum::http::StatusCode::OK, body))
+
+    let bytes = std::fs::read(&path)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // defaults
+    let offset = q.offset_lines.unwrap_or(0);
+    let max_lines = clamp_max_lines(q.max_lines.unwrap_or(5000));
+
+    // Cut by line boundaries, preserving original '\n' bytes.
+    // We scan bytes and record start offsets of each line, plus end offset.
+    let mut line_starts: Vec<usize> = Vec::new();
+    line_starts.push(0);
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            if i + 1 < bytes.len() {
+                line_starts.push(i + 1);
+            }
+        }
+    }
+    let total_lines = line_starts.len();
+
+    if offset > total_lines {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "offset_lines too large".into()));
+    }
+
+    let end_line = (offset + max_lines).min(total_lines);
+    let start_byte = *line_starts.get(offset).unwrap_or(&bytes.len());
+
+    // Compute end_byte: end of selected last line (inclusive of '\n' if present)
+    let end_byte = if end_line >= total_lines {
+        bytes.len()
+    } else {
+        // end_line is a start of a later line, so end_byte is that start
+        *line_starts.get(end_line).unwrap_or(&bytes.len())
+    };
+
+    let chunk = bytes[start_byte..end_byte].to_vec();
+
+    let eof = if end_line >= total_lines { "1" } else { "0" };
+    let next_offset = end_line.to_string();
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("Content-Type", axum::http::HeaderValue::from_static("application/octet-stream"));
+    headers.insert("X-GMF-EOF", axum::http::HeaderValue::from_str(eof).unwrap());
+    headers.insert("X-GMF-NEXT-OFFSET", axum::http::HeaderValue::from_str(&next_offset).unwrap());
+    headers.insert("X-GMF-TOTAL-LINES", axum::http::HeaderValue::from_str(&total_lines.to_string()).unwrap());
+
+    Ok((axum::http::StatusCode::OK, headers, chunk))
 }
+
 
 async fn health() -> &'static str { "ok" }
 
