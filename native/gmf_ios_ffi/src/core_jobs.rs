@@ -1,17 +1,19 @@
 mod rw_eq_v1;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind")]
 pub enum JobInput {
-    #[serde(rename="rw_eq_v1")]
-    RwEqV1 { theory: String, start: rw_eq_v1::Expr, goal: rw_eq_v1::Expr, max_steps: u32, max_nodes: u32 },
     #[serde(rename="pow_v1")]
     PowV1 { seed_hex: String, difficulty: u32 },
 
     #[serde(rename="poly_identity_v1")]
     PolyIdentityV1 { vars: Vec<String>, lhs: Vec<Term>, rhs: Vec<Term> },
+
+    #[serde(rename="rw_eq_v1")]
+    RwEqV1 { theory: String, start: rw_eq_v1::Expr, goal: rw_eq_v1::Expr, max_steps: u32, max_nodes: u32 },
 }
 
 #[derive(Debug, Serialize)]
@@ -22,6 +24,9 @@ pub enum JobOutput {
 
     #[serde(rename="poly_identity_v1_result")]
     PolyIdentityV1Result { ok: bool, nf: Vec<Term>, hash: String },
+
+    #[serde(rename="rw_eq_v1_result")]
+    RwEqV1Result { ok: bool, final_: rw_eq_v1::Expr, steps: Vec<rw_eq_v1::Step>, stats: rw_eq_v1::Stats },
 
     #[serde(rename="gmf_error")]
     Error { message: String },
@@ -71,7 +76,6 @@ fn parse_seed_hex(seed_hex: &str) -> Result<Vec<u8>, String> {
 
 fn pow_search(seed_hex: &str, difficulty: u32) -> Result<JobOutput, String> {
     let seed = parse_seed_hex(seed_hex)?;
-    // simple linear search; later we can add randomized start or multithreading
     let mut nonce: u64 = 0;
     loop {
         let d = pow_hash(&seed, nonce);
@@ -79,7 +83,6 @@ fn pow_search(seed_hex: &str, difficulty: u32) -> Result<JobOutput, String> {
             return Ok(JobOutput::PowV1Result { nonce, hash_hex: hex::encode(d) });
         }
         nonce = nonce.wrapping_add(1);
-        // safeguard: avoid infinite if difficulty insane on mobile; cap search for now
         if nonce == 0 {
             return Err("nonce wrapped; difficulty too high".to_string());
         }
@@ -87,13 +90,9 @@ fn pow_search(seed_hex: &str, difficulty: u32) -> Result<JobOutput, String> {
 }
 
 fn normalize_terms(mut terms: Vec<Term>) -> Vec<Term> {
-    // remove zero coeff
     terms.retain(|t| t.c != 0);
-
-    // sort by exponent vector lex
     terms.sort_by(|a,b| a.e.cmp(&b.e));
 
-    // combine like terms
     let mut out: Vec<Term> = Vec::new();
     for t in terms {
         if let Some(last) = out.last_mut() {
@@ -106,7 +105,6 @@ fn normalize_terms(mut terms: Vec<Term>) -> Vec<Term> {
     }
     out.retain(|t| t.c != 0);
 
-    // canonical: sort again; also canonicalize exponent length by trimming trailing zeros
     for t in out.iter_mut() {
         while t.e.last().copied() == Some(0) { t.e.pop(); }
     }
@@ -115,7 +113,6 @@ fn normalize_terms(mut terms: Vec<Term>) -> Vec<Term> {
 }
 
 fn poly_identity(vars: &[String], lhs: &[Term], rhs: &[Term]) -> Result<JobOutput, String> {
-    // verify exponent arity
     let n = vars.len();
     let mut diff: Vec<Term> = Vec::new();
     for t in lhs.iter() {
@@ -129,8 +126,6 @@ fn poly_identity(vars: &[String], lhs: &[Term], rhs: &[Term]) -> Result<JobOutpu
         diff.push(u);
     }
     let nf = normalize_terms(diff);
-
-    // hash canonical nf json (sorted by normalize_terms)
     let nf_json = serde_json::to_vec(&nf).map_err(|e| e.to_string())?;
     let hash = sha256_hex(&nf_json);
     let ok = nf.is_empty();
@@ -141,25 +136,11 @@ pub fn run_job_json(input_json: &str) -> JobOutput {
     let ji: Result<JobInput, _> = serde_json::from_str(input_json);
     match ji {
         Err(e) => JobOutput::Error { message: format!("bad input json: {e}") },
+
         Ok(JobInput::PowV1{seed_hex, difficulty}) => {
             match pow_search(&seed_hex, difficulty) {
                 Ok(o) => o,
                 Err(msg) => JobOutput::Error{ message: msg },
-            }
-        }
-        Ok(JobInput::RwEqV1{theory, start, goal, max_steps, max_nodes}) => {
-            if theory != "ring_lite_v1" {
-                return JobOutput::Error{ message: "unsupported theory".to_string() };
-            }
-            match rw_eq_v1::solve_rw_eq_v1(start, goal, max_steps, max_nodes) {
-                rw_eq_v1::Output::Ok{ok, final_, steps, stats} => {
-                    // emit as JSON inside output string (outer layer JobOutput keeps compatibility)
-                    let obj = serde_json::json!({"kind":"rw_eq_v1_result","ok":ok,"final":final_,"steps":steps,"stats":stats});
-                    return JobOutput::Error{ message: obj.to_string() };
-                }
-                rw_eq_v1::Output::Err{message} => {
-                    return JobOutput::Error{ message };
-                }
             }
         }
 
@@ -167,6 +148,16 @@ pub fn run_job_json(input_json: &str) -> JobOutput {
             match poly_identity(&vars, &lhs, &rhs) {
                 Ok(o) => o,
                 Err(msg) => JobOutput::Error{ message: msg },
+            }
+        }
+
+        Ok(JobInput::RwEqV1{theory, start, goal, max_steps, max_nodes}) => {
+            if theory != "ring_lite_v1" {
+                return JobOutput::Error{ message: "unsupported theory".to_string() };
+            }
+            match rw_eq_v1::solve_rw_eq_v1(start, goal, max_steps, max_nodes) {
+                rw_eq_v1::Output::Ok{ok, final_, steps, stats} => JobOutput::RwEqV1Result{ ok, final_, steps, stats },
+                rw_eq_v1::Output::Err{message} => JobOutput::Error{ message },
             }
         }
     }
