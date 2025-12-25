@@ -1356,6 +1356,180 @@ async fn audit_finalize(
     Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
 }
 
+
+fn monthly_report_path(ym: &str) -> PathBuf {
+    PathBuf::from("ledger/reports/monthly").join(format!("{ym}.monthly_final.json"))
+}
+fn yearly_report_path(y: &str) -> PathBuf {
+    PathBuf::from("ledger/reports/yearly").join(format!("{y}.yearly_final.json"))
+}
+
+fn is_date_triple_ok(date: &str) -> bool {
+    final_snapshot_path(date).exists()
+        && audit_final_path(date).exists()
+        && meta_audit_final_path(date).exists()
+}
+
+fn month_dates_utc(ym: &str) -> Result<Vec<String>, String> {
+    // ym = YYYY-MM
+    if ym.len()!=7 || &ym[4..5]!="-" { return Err("bad ym".into()); }
+    let y: i32 = ym[0..4].parse().map_err(|_| "bad year")?;
+    let m: u32 = ym[5..7].parse().map_err(|_| "bad month")?;
+    if m<1 || m>12 { return Err("bad month".into()); }
+    let start = chrono::NaiveDate::from_ymd_opt(y, m, 1).ok_or("bad date")?;
+    let end = if m==12 {
+        chrono::NaiveDate::from_ymd_opt(y+1, 1, 1).ok_or("bad end")?
+    } else {
+        chrono::NaiveDate::from_ymd_opt(y, m+1, 1).ok_or("bad end")?
+    };
+    let mut out = vec![];
+    let mut d = start;
+    while d < end {
+        out.push(d.format("%Y-%m-%d").to_string());
+        d = d.succ_opt().ok_or("date overflow")?;
+    }
+    Ok(out)
+}
+
+fn year_dates_utc(y: &str) -> Result<Vec<String>, String> {
+    if y.len()!=4 { return Err("bad year".into()); }
+    let yy: i32 = y.parse().map_err(|_| "bad year")?;
+    let start = chrono::NaiveDate::from_ymd_opt(yy, 1, 1).ok_or("bad start")?;
+    let end = chrono::NaiveDate::from_ymd_opt(yy+1, 1, 1).ok_or("bad end")?;
+    let mut out = vec![];
+    let mut d = start;
+    while d < end {
+        out.push(d.format("%Y-%m-%d").to_string());
+        d = d.succ_opt().ok_or("date overflow")?;
+    }
+    Ok(out)
+}
+
+fn load_json_file(p: &PathBuf) -> Result<serde_json::Value, String> {
+    let txt = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+    serde_json::from_str(&txt).map_err(|e| e.to_string())
+}
+
+fn build_report_payload(kind: &str, period_id: &str, dates: Vec<String>) -> Result<serde_json::Value, String> {
+    let mut included = vec![];
+    let mut excluded = vec![];
+    let mut finals = vec![];
+    let mut audits = vec![];
+    let mut metas = vec![];
+
+    for d in dates {
+        if !is_date_triple_ok(&d) { excluded.push(d); continue; }
+        let f = load_json_file(&final_snapshot_path(&d))?;
+        let a = load_json_file(&audit_final_path(&d))?;
+        let m = load_json_file(&meta_audit_final_path(&d))?;
+
+        let fs = f.get("final_payload").and_then(|p| p.get("ssr_sha256")).and_then(|v| v.as_str()).ok_or("bad final")?;
+        let al = a.get("audit_final_payload").and_then(|p| p.get("audit_log_sha256")).and_then(|v| v.as_str()).ok_or("bad audit_final")?;
+        let ml = m.get("meta_audit_final_payload").and_then(|p| p.get("meta_audit_log_sha256")).and_then(|v| v.as_str()).ok_or("bad meta_audit_final")?;
+
+        included.push(d);
+        finals.push(serde_json::Value::String(fs.to_string()));
+        audits.push(serde_json::Value::String(al.to_string()));
+        metas.push(serde_json::Value::String(ml.to_string()));
+    }
+
+    let bindings = serde_json::json!({
+        "daily_final_ssr_sha256_list": finals,
+        "daily_audit_log_sha256_list": audits,
+        "daily_meta_audit_log_sha256_list": metas
+    });
+
+    let roll_src = serde_json::json!({"included_dates": included, "bindings": bindings});
+    let canon = canonical_json_bytes(&roll_src);
+    let roll = sha2::Sha256::digest(&canon);
+    let roll_hex = hex::encode(roll);
+
+    Ok(serde_json::json!({
+        "kind": kind,
+        "period_id": period_id,
+        "generated_at_unix_ms": now_unix_ms(),
+        "included_dates": roll_src.get("included_dates").cloned().unwrap_or(serde_json::json!([])),
+        "excluded_dates": excluded,
+        "aggregates": {
+            "days_count": roll_src.get("included_dates").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+            "sum_main_credits_micro": serde_json::Value::Null,
+            "sum_audit_points_micro": serde_json::Value::Null
+        },
+        "bindings": bindings,
+        "merkle_or_rollup": {
+            "rollup_sha256": roll_hex,
+            "method": "sha256_canon_v1"
+        }
+    }))
+}
+
+fn write_report_once(path: &PathBuf, payload_key: &str, payload: serde_json::Value) -> Result<serde_json::Value, String> {
+    if path.exists() {
+        let v = load_json_file(path)?;
+        return Ok(v);
+    }
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let canon = canonical_json_bytes(&payload);
+    let msg = sha2::Sha256::digest(&canon);
+    let sig_b64 = server_sign_fn.as_ref()(&msg);
+
+    let env = serde_json::json!({
+        payload_key: payload,
+        "server_pubkey_b64": server_pubkey_b64_str,
+        "server_sig_b64": sig_b64
+    });
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&env).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(env)
+}
+
+async fn monthly_report_final(axum::extract::Path(ym): axum::extract::Path<String>)
+-> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    let p = monthly_report_path(&ym);
+    if !p.exists() { return Err((axum::http::StatusCode::NOT_FOUND, "no monthly_final".into())); }
+    let txt = std::fs::read_to_string(&p).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((axum::http::StatusCode::OK, txt))
+}
+
+async fn yearly_report_final(axum::extract::Path(y): axum::extract::Path<String>)
+-> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    let p = yearly_report_path(&y);
+    if !p.exists() { return Err((axum::http::StatusCode::NOT_FOUND, "no yearly_final".into())); }
+    let txt = std::fs::read_to_string(&p).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((axum::http::StatusCode::OK, txt))
+}
+
+async fn monthly_report_finalize(
+    axum::extract::Path(ym): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String,String>>
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    let admin = std::env::var("GMF_ADMIN_TOKEN").unwrap_or_default();
+    let tok = q.get("token").cloned().unwrap_or_default();
+    if !admin.is_empty() && tok != admin { return Err((axum::http::StatusCode::FORBIDDEN, "forbidden".into())); }
+
+    let dates = month_dates_utc(&ym).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    let payload = build_report_payload("monthly", &ym, dates).map_err(|e| (axum::http::StatusCode::PRECONDITION_FAILED, e))?;
+    let env = write_report_once(&monthly_report_path(&ym), "monthly_final_payload", payload)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
+}
+
+async fn yearly_report_finalize(
+    axum::extract::Path(y): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String,String>>
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    let admin = std::env::var("GMF_ADMIN_TOKEN").unwrap_or_default();
+    let tok = q.get("token").cloned().unwrap_or_default();
+    if !admin.is_empty() && tok != admin { return Err((axum::http::StatusCode::FORBIDDEN, "forbidden".into())); }
+
+    let dates = year_dates_utc(&y).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    let payload = build_report_payload("yearly", &y, dates).map_err(|e| (axum::http::StatusCode::PRECONDITION_FAILED, e))?;
+    let env = write_report_once(&yearly_report_path(&y), "yearly_final_payload", payload)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
