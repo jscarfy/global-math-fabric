@@ -23,3 +23,14 @@ This is the "root hash" of build outputs.
 - docker_image MUST contain "@sha256:" (digest pin), e.g.
   "leanprovercommunity/lean@sha256:...."
 - Tag-only images (":latest", ":vX.Y") are NOT allowed for long-horizon auditability.
+
+## Source pinning fields (HOST-computed, REQUIRED by default)
+- git_rev: string (resolved HEAD commit SHA)
+- git_tree: string (git rev-parse HEAD^{tree})
+- lean_toolchain_sha256: hex string (sha256 of lean-toolchain file bytes; "" if missing)
+- lakefile_sha256: hex string (sha256 of Lakefile.lean or lakefile.lean; "" if missing)
+- lake_manifest_sha256: hex string (sha256 of lake-manifest.json; "" if missing)
+
+## Task params toggles
+- require_source_hash: bool (default true)
+  - if false, agreement ignores the 5 source pinning fields above.
