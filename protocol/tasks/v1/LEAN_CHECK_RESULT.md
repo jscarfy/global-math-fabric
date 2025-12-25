@@ -34,3 +34,14 @@ This is the "root hash" of build outputs.
 ## Task params toggles
 - require_source_hash: bool (default true)
   - if false, agreement ignores the 5 source pinning fields above.
+
+## Expected source pinning (TASK PARAMS, HARD GATE)
+If params.require_source_hash=true, the relay MAY enforce hard-gate checks:
+
+- expected_git_rev: string (required when hard-gate enabled)
+- expected_git_tree: string (required when hard-gate enabled)
+- expected_lean_toolchain_sha256: string (optional hard-gate)
+- expected_lakefile_sha256: string (optional hard-gate)
+- expected_lake_manifest_sha256: string (optional hard-gate)
+
+If any required expected_* is present and does not match the submitted result_core field, the relay MUST reject the submission (422) and MAY emit a zero-credit SSR for auditability.
