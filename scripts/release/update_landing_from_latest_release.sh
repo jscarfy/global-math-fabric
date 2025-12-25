@@ -89,6 +89,8 @@ android_section.append("<h2>Android</h2>")
 apk_url = f"{pages}/releases/android/latest.apk"
 apk_sha = f"{pages}/releases/android/latest.apk.sha256"
 apk_exists = Path("releases/android/latest.apk").exists()
+ias_file = Path("releases/android/internal_app_sharing_url.txt")
+ias_url = ias_file.read_text().strip() if ias_file.exists() else ""
 if android and android.startswith("http"):
     android_section.append(btn(android,"Play internal testing link"))
 else:
@@ -98,6 +100,8 @@ if apk_exists:
     if Path("releases/android/latest.apk.sha256").exists():
         android_section.append(btn(apk_sha, "SHA256 (latest.apk.sha256)"))
     android_section.append('<p class="muted">Sideload: enable “Install unknown apps” for your browser/file manager, then install. You can always Pause/Stop inside the app.</p>')
+if ias_url.startswith("http"):
+    android_section.append(btn(ias_url, "Install via Internal App Sharing (fast link)"))
 
 html = f"""<!doctype html>
 <html>
