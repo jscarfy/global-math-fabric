@@ -86,10 +86,18 @@ mac_section.append('<p class="muted">If DMG/ZIP links are missing, upload notari
 
 android_section = []
 android_section.append("<h2>Android</h2>")
+apk_url = f"{pages}/releases/android/latest.apk"
+apk_sha = f"{pages}/releases/android/latest.apk.sha256"
+apk_exists = Path("releases/android/latest.apk").exists()
 if android and android.startswith("http"):
     android_section.append(btn(android,"Play internal testing link"))
 else:
     android_section.append('<p class="muted">Maintainer: put Play internal testing link into <code>releases/android_play_link.txt</code>.</p>')
+if apk_exists:
+    android_section.append(btn(apk_url, "Download APK (latest.apk)"))
+    if Path("releases/android/latest.apk.sha256").exists():
+        android_section.append(btn(apk_sha, "SHA256 (latest.apk.sha256)"))
+    android_section.append('<p class="muted">Sideload: enable “Install unknown apps” for your browser/file manager, then install. You can always Pause/Stop inside the app.</p>')
 
 html = f"""<!doctype html>
 <html>
