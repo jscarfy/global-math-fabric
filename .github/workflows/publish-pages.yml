@@ -14,7 +14,7 @@ jobs:
       - name: Prepare pages content
         run: |
           mkdir -p _pages/releases
-          cp -f releases/appcast.xml _pages/releases/appcast.xml
+          cp -rf releases/. _pages/releases/ || true
           mkdir -p _pages/releases/windows
           cp -rf releases/windows/. _pages/releases/windows/ || true
 
