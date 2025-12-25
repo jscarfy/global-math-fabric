@@ -538,20 +538,24 @@ def _merkle_verify_proof(leaf_hash: bytes, proof: list[dict], root_hex: str) -> 
     return _hx(cur) == root_hex.lower()
 
 def _audit_indices(seed_hex: str, num_chunks: int, k: int) -> list[int]:
-    # deterministic indices from seed: idx_i = sha256(seed||i) mod num_chunks
+    # deterministic indices from seed; ALWAYS include 0 for header chunk.
+    # remaining (k-1) indices are derived: idx_i = sha256(seed||i) mod num_chunks, excluding 0 if possible.
+    if num_chunks <= 0:
+        return [0]
     seed = _unhex(seed_hex)
-    out = []
-    seen = set()
-    for i in range(max(1, k*3)):  # try more to get unique
+    out = [0]
+    seen = set(out)
+    need = max(1, int(k)) - 1
+    tries = max(1, need * 5)
+    for i in range(tries):
         h = _sha256(seed + i.to_bytes(4, "big"))
         idx = int.from_bytes(h[:8], "big") % num_chunks
-        if idx not in seen:
+        if idx not in seen and idx != 0:
             out.append(idx); seen.add(idx)
-        if len(out) >= k:
+        if len(out) >= 1 + need:
             break
-    # if still short (tiny num_chunks), allow repeats by filling
-    while len(out) < k:
-        out.append(out[-1] if out else 0)
+    while len(out) < 1 + need:
+        out.append(0)
     return out
 
 def _audit_transcript_path(proof_hash: str) -> Path:
@@ -565,3 +569,28 @@ def _write_audit_transcript(obj: dict) -> None:
     p = _audit_transcript_path(ph)
     if not p.exists():
         p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _verify_bundle_v1_header(header_bytes: bytes, header_sha256: str) -> tuple[bool,str]:
+    # must fit in chunk0; must be utf-8 json
+    if not header_bytes or len(header_bytes) > 60000:
+        return False, "bundle_header_size_invalid"
+    try:
+        got = _sha256_hex_bytes(header_bytes)
+        if str(got) != str(header_sha256).lower():
+            return False, "bundle_header_sha_mismatch"
+        txt = header_bytes.decode("utf-8", errors="strict")
+        obj = json.loads(txt)
+    except Exception:
+        return False, "bundle_header_parse_failed"
+
+    if obj.get("kind") != "gmf_trace_bundle_header" or int(obj.get("version",0)) != 1 or obj.get("format") != "gmf_bundle_v1":
+        return False, "bundle_header_fields_invalid"
+
+    files = obj.get("files") or []
+    if not isinstance(files, list):
+        return False, "bundle_header_files_invalid"
+    names = {f.get("name") for f in files if isinstance(f, dict)}
+    req = {"Main.lean","build.log","versions.json"}
+    if not req.issubset(names):
+        return False, "bundle_header_missing_required_files"
+    return True, ""
