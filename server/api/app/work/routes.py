@@ -886,7 +886,7 @@ import random
 def _make_job_input_v1(topic: str) -> dict:
     # topic can select job families; default -> pow_v1
     if topic == "rw":
-        return _make_rw_eq_job_v2()
+        return _make_rw_eq_job_v3()
     if topic == "poly":
         # simple identity: (x+y)^2 == x^2 + 2xy + y^2
         return {
@@ -1001,6 +1001,154 @@ def _verify_job_output_v1(job_input: dict, output_str: str) -> tuple[bool,str,in
         credits = min(1000, 10 + 2*len(lhs) + 2*len(rhs) + sum(sum(int(x) for x in (t.get("e") or [])) for t in lhs+rhs))
         return (True, "ok", int(credits))
 
+
+    if kind == "rw_eq_v3":
+        if ok_kind != "rw_eq_v3_result":
+            return (False, "rw_wrong_kind", 0)
+        # verify via v2 replay/hash/pow first
+        okv, rsv, cred = _verify_rw_eq_v2(job_input, out)
+        if not okv:
+            return (okv, rsv, 0)
+        # checkpoints verify
+        cp_idx = job_input.get('checkpoint_indices') or []
+        cp_out = out.get('checkpoints') or []
+        # build map
+        mp = {}
+        for x in cp_out:
+            try:
+                mp[int(x.get('i'))] = str(x.get('expr_sha256','')).lower()
+            except Exception:
+                pass
+        # recompute by replaying and hashing expr at indices
+        # reuse local replay logic from _verify_rw_eq_v2: we recompute states after i steps
+        start = job_input.get('start')
+        steps = out.get('steps') or []
+        max_nodes = int(job_input.get('max_nodes', 0))
+        # expr hashing: canonical json sha256
+        def expr_sha(e):
+            return hashlib.sha256(json.dumps(e, sort_keys=True, separators=(',',':'), ensure_ascii=False).encode('utf-8')).hexdigest()
+        # simple replay apply_rule/get_at/set_at from _verify_rw_eq_v2 via inner functions duplication is avoided by calling it? keep minimal:
+        # We call _verify_rw_eq_v2 already, so replay is known-good. Here we do a second replay to hit checkpoints.
+        def nodes(expr):
+            if not isinstance(expr, dict): return 0
+            t = expr.get('t')
+            if t in ('c','v'): return 1
+            if t in ('+','*'):
+                a = expr.get('a') or []
+                return 1 + sum(nodes(x) for x in a)
+            return 1
+        def canon_key(expr):
+            t = expr.get('t')
+            if t=='c': return f"c:{int(expr.get('v',0))}"
+            if t=='v': return f"v:{expr.get('n','')}"
+            if t in ('+','*'):
+                ks=[canon_key(x) for x in (expr.get('a') or [])]; ks.sort(); return t+'('+','.join(ks)+')'
+            return '?'
+        def get_at(expr, path):
+            cur=expr
+            for i in path:
+                a=cur.get('a') or []
+                if int(i)<0 or int(i)>=len(a): return None
+                cur=a[int(i)]
+            return cur
+        def set_at(expr, path, new_sub):
+            if not path: return new_sub
+            cur=expr
+            for i in path[:-1]:
+                a=cur.get('a') or []
+                cur=a[int(i)]
+            a=cur.get('a') or []
+            a[int(path[-1])] = new_sub
+            cur['a']=a
+            return expr
+        def apply_rule(sub, rule):
+            t=sub.get('t')
+            if rule=='add_flatten' and t=='+':
+                outa=[]; ch=False
+                for x in (sub.get('a') or []):
+                    if isinstance(x,dict) and x.get('t')=='+': outa.extend(x.get('a') or []); ch=True
+                    else: outa.append(x)
+                if ch: sub['a']=outa
+                return ch
+            if rule=='mul_flatten' and t=='*':
+                outa=[]; ch=False
+                for x in (sub.get('a') or []):
+                    if isinstance(x,dict) and x.get('t')=='*': outa.extend(x.get('a') or []); ch=True
+                    else: outa.append(x)
+                if ch: sub['a']=outa
+                return ch
+            if rule=='add_sort' and t=='+':
+                a=sub.get('a') or []; b=[canon_key(x) for x in a]; a.sort(key=canon_key); sub['a']=a; return b!=[canon_key(x) for x in a]
+            if rule=='mul_sort' and t=='*':
+                a=sub.get('a') or []; b=[canon_key(x) for x in a]; a.sort(key=canon_key); sub['a']=a; return b!=[canon_key(x) for x in a]
+            if rule=='add_drop0' and t=='+':
+                a=[x for x in (sub.get('a') or []) if not (isinstance(x,dict) and x.get('t')=='c' and int(x.get('v',0))==0)]
+                if len(a)==0: return {'t':'c','v':0}
+                if len(a)==1: return a[0]
+                sub['a']=a; return True
+            if rule=='mul_drop1' and t=='*':
+                a=[x for x in (sub.get('a') or []) if not (isinstance(x,dict) and x.get('t')=='c' and int(x.get('v',1))==1)]
+                if len(a)==0: return {'t':'c','v':1}
+                if len(a)==1: return a[0]
+                sub['a']=a; return True
+            if rule=='mul_annihilate0' and t=='*':
+                for x in (sub.get('a') or []):
+                    if isinstance(x,dict) and x.get('t')=='c' and int(x.get('v',0))==0: return {'t':'c','v':0}
+                return False
+            if rule=='add_foldconst' and t=='+':
+                s=0; outa=[]; seen=False
+                for x in (sub.get('a') or []):
+                    if isinstance(x,dict) and x.get('t')=='c': s += int(x.get('v',0)); seen=True
+                    else: outa.append(x)
+                if seen: outa.append({'t':'c','v':s})
+                sub['a']=outa; return seen
+            if rule=='mul_foldconst' and t=='*':
+                p=1; outa=[]; seen=False
+                for x in (sub.get('a') or []):
+                    if isinstance(x,dict) and x.get('t')=='c': p *= int(x.get('v',1)); seen=True
+                    else: outa.append(x)
+                if seen: outa.append({'t':'c','v':p})
+                sub['a']=outa; return seen
+            if rule=='distribute_left' and t=='*':
+                a=sub.get('a') or []
+                if len(a)!=2: return False
+                A,B=a[0],a[1]
+                if isinstance(B,dict) and B.get('t')=='+':
+                    terms=B.get('a') or []
+                    return {'t':'+','a':[{'t':'*','a':[A,t]} for t in terms]}
+                return False
+            if rule=='distribute_right' and t=='*':
+                a=sub.get('a') or []
+                if len(a)!=2: return False
+                B,A=a[0],a[1]
+                if isinstance(B,dict) and B.get('t')=='+':
+                    terms=B.get('a') or []
+                    return {'t':'+','a':[{'t':'*','a':[t,A]} for t in terms]}
+                return False
+            return False
+        cur = start
+        # checkpoint 0
+        if 0 in cp_idx:
+            if mp.get(0,'') != expr_sha(cur):
+                return (False, 'rw_checkpoint_mismatch', 0)
+        for k, st in enumerate(steps):
+            sub = get_at(cur, st.get('path') or [])
+            if sub is None or not isinstance(sub, dict):
+                return (False, 'rw_bad_path', 0)
+            applied = apply_rule(sub, st.get('rule'))
+            if applied is False:
+                return (False, 'rw_rule_not_applicable', 0)
+            if isinstance(applied, dict):
+                cur = set_at(cur, st.get('path') or [], applied)
+            if nodes(cur) > max_nodes:
+                return (False, 'rw_max_nodes_exceeded', 0)
+            idx = k+1
+            if idx in cp_idx:
+                if mp.get(idx,'') != expr_sha(cur):
+                    return (False, 'rw_checkpoint_mismatch', 0)
+        # bonus credits for checkpoints
+        cred2 = int(cred + 25*len(cp_idx))
+        return (True, 'ok', cred2)
 
     if kind == "rw_eq_v2":
         if ok_kind != "rw_eq_v2_result":
@@ -1652,4 +1800,34 @@ def _make_rw_eq_job_v2(seed_hex=None) -> dict:
         "max_nodes": max_nodes,
         "challenge_seed_hex": hashlib.sha256((seed_hex + ":pow").encode("utf-8")).hexdigest(),
         "challenge_pow_difficulty": 18,
+    }
+
+
+def _make_rw_eq_job_v3() -> dict:
+    base_seed = hashlib.sha256(os.urandom(32)).hexdigest()
+
+    # reuse your existing seeded generator v1 (start/goal)
+    base = _make_rw_eq_job_v1(base_seed)
+    start = base["start"]
+    goal  = base["goal"]
+    max_steps = int(base.get("max_steps", 600))
+    max_nodes  = int(base.get("max_nodes", 6000))
+
+    # choose checkpoint indices deterministically from seed (but unknown to attacker beforehand)
+    rng = random.Random(int(base_seed[:16], 16))
+    # pick 4 indices in [0..min(steps_bound, 64)] just as a stable first version (works even if actual steps shorter)
+    # server verifier will accept indices beyond produced steps? -> we avoid that by picking within 0..64 and solver max_steps >= 600.
+    # We'll allow indices up to 40 to be safe.
+    cp = sorted(set([0] + [rng.randint(1, 40) for _ in range(4)]))
+
+    return {
+        "kind":"rw_eq_v3",
+        "theory":"ring_lite_v1",
+        "start": start,
+        "goal": goal,
+        "max_steps": max_steps,
+        "max_nodes": max_nodes,
+        "challenge_seed_hex": hashlib.sha256((base_seed + ":pow").encode("utf-8")).hexdigest(),
+        "challenge_pow_difficulty": 18,
+        "checkpoint_indices": cp
     }
