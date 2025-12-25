@@ -1935,6 +1935,92 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // auto-finalize previous month/year report_audit_final after log quiet for grace seconds
+    let report_audit_grace_secs: u64 = env::var("GMF_REPORT_AUDIT_FINALIZE_GRACE_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(1800);
+    let report_audit_interval_secs: u64 = env::var("GMF_REPORT_AUDIT_FINALIZE_INTERVAL_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(300);
+
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        loop {
+            let now = Utc::now();
+            let ym = prev_month_id(now);
+            let y  = prev_year_id(now);
+
+            // monthly
+            if let Ok(lp) = report_audit_log_path("monthly",&ym) {
+                if lp.exists() {
+                    let fp = report_audit_final_path("monthly",&ym).unwrap();
+                    if !fp.exists() {
+                        if let Ok(md) = std::fs::metadata(&lp) {
+                            if let Ok(mtime) = md.modified() {
+                                if let Ok(elapsed) = mtime.elapsed() {
+                                    if elapsed.as_secs() >= report_audit_grace_secs {
+                                        let _ = write_report_audit_final_once("monthly",&ym);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // yearly
+            if let Ok(lp) = report_audit_log_path("yearly",&y) {
+                if lp.exists() {
+                    let fp = report_audit_final_path("yearly",&y).unwrap();
+                    if !fp.exists() {
+                        if let Ok(md) = std::fs::metadata(&lp) {
+                            if let Ok(mtime) = md.modified() {
+                                if let Ok(elapsed) = mtime.elapsed() {
+                                    if elapsed.as_secs() >= report_audit_grace_secs {
+                                        let _ = write_report_audit_final_once("yearly",&y);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            sleep(Duration::from_secs(report_audit_interval_secs)).await;
+        }
+    });
+
+    // auto-finalize period meta_audit_final for previous month/year (date = period_id)
+    let period_meta_grace_secs: u64 = env::var("GMF_PERIOD_META_AUDIT_FINALIZE_GRACE_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(1800);
+    let period_meta_interval_secs: u64 = env::var("GMF_PERIOD_META_AUDIT_FINALIZE_INTERVAL_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(300);
+
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        loop {
+            let now = Utc::now();
+            let ym = prev_month_id(now);
+            let y  = prev_year_id(now);
+
+            for pid in [ym, y] {
+                let lp = meta_audit_path(&pid);
+                let fp = meta_audit_final_path(&pid);
+                if lp.exists() && !fp.exists() {
+                    if let Ok(md) = std::fs::metadata(&lp) {
+                        if let Ok(mtime) = md.modified() {
+                            if let Ok(elapsed) = mtime.elapsed() {
+                                if elapsed.as_secs() >= period_meta_grace_secs {
+                                    let _ = write_meta_audit_final_once(&pid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            sleep(Duration::from_secs(period_meta_interval_secs)).await;
+        }
+    });
+
+
 
 
 
