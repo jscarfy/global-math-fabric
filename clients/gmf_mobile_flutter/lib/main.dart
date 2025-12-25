@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'gmf/tray.dart';
 import 'gmf/consent_store.dart';
 import 'gmf/consent_screen.dart';
 import 'package:flutter/material.dart';
@@ -48,6 +49,9 @@ void callbackDispatcher() {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // desktop tray visibility (best-effort)
+  try { await GMFTray.init(); } catch (_) {}
+
   IosBgChannel.ensureInstalled();
   Workmanager().initialize(callbackDispatcher, isInDebugMode: false);
   runApp(const App());
