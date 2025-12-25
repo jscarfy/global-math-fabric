@@ -1,0 +1,26 @@
+name: generate-release-notes
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes HTML
+        run: |
+          ./scripts/release/generate_release_notes_html.sh "${GITHUB_REF_NAME}"
+
+      - name: Commit release notes back to main
+        run: |
+          git config user.name "gmf-bot"
+          git config user.email "gmf-bot@users.noreply.github.com"
+          git add releases/RELEASE_NOTES/"${GITHUB_REF_NAME}".html
+          git commit -m "release: add notes ${GITHUB_REF_NAME}" || true
+          git push origin HEAD:main || true
