@@ -9,6 +9,7 @@ from app.models.task import TaskDef, TaskInstance, Result
 from app.models.client import Client, CreditEvent
 from app.models.receipt import Receipt
 from app.models.replay import ReplayCheck
+from app.models.device import Device, DeviceChallenge, Heartbeat
 from app.schemas.task import (
     EnqueueResponse,
     CreateInstancesRequest, CreateInstancesResponse,
@@ -18,9 +19,12 @@ from app.schemas.task import (
 from app.schemas.auth import RegisterRequest, RegisterResponse
 from app.schemas.credits import MeResponse, LeaderboardResponse, LeaderboardRow
 from app.schemas.receipt import ReceiptsResponse, ReceiptRow
+from app.schemas.device import DeviceRegisterRequest, DeviceRegisterResponse, DeviceChallengeResponse, HeartbeatRequest, HeartbeatResponse
+from app.schemas.attest import DeviceAttestRequest, DeviceAttestResponse
 from app.schemas.replay import ReplayQueueResponse, ReplayQueueItem, ReplayReportRequest, ReplayReportResponse
 from app.security.signing import load_truststore, verify_bundle_ed25519
 from app.security.receipt_signing import sign_receipt
+from app.security.device_auth import verify_ed25519_signature
 from app.security.risk import decay_risk, fingerprint_hash, result_weight_from_risk, reward_mult_from_risk, _geti
 
 app = FastAPI(title="Global Math Fabric API")
@@ -220,6 +224,16 @@ def lease_instance(
 
     if require_mobile_abi:
         q = q.filter(TaskDef.manifest["abi"].as_string() == "gmf-abi-1")
+
+    
+    # Prefer heavy tasks when allowed (otherwise we filtered them out already)
+    if heavy_allowed:
+        q = q.order_by(
+            (TaskDef.manifest["power_profile"].as_string() == "heavy").desc(),
+            TaskInstance.created_at.asc()
+        )
+    else:
+        q = q.order_by(TaskInstance.created_at.asc())
 
     inst = q.order_by(TaskInstance.priority.desc(), TaskInstance.created_at.asc()).first()
 
@@ -503,3 +517,81 @@ def attrib_mismatch_clients(db: Session, inst: TaskInstance) -> list[Client]:
     if not client_ids:
         return []
     return db.query(Client).filter(Client.id.in_(client_ids)).all()
+
+
+@app.post("/devices/register", response_model=DeviceRegisterResponse)
+def device_register(
+    req: DeviceRegisterRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    c = require_client(db, x_api_key, request=request)
+    # Upsert by pubkey
+    d = db.query(Device).filter(Device.pubkey_b64 == req.pubkey_b64).first()
+    if d:
+        if str(d.client_id_fk) != str(c.id):
+            # same pubkey used by different client => reject (identity collision)
+            raise HTTPException(status_code=409, detail="pubkey_already_registered_to_other_client")
+        d.label = req.label or d.label
+        d.platform = req.platform or d.platform
+        d.last_seen_at = datetime.utcnow()
+        db.add(d); db.commit()
+        return DeviceRegisterResponse(device_id=str(d.id), note="already_registered")
+    d = Device(client_id_fk=c.id, pubkey_b64=req.pubkey_b64, label=req.label, platform=req.platform)
+    db.add(d); db.commit()
+    return DeviceRegisterResponse(device_id=str(d.id), note="ok")
+
+@app.get("/devices/{device_id}/challenge", response_model=DeviceChallengeResponse)
+def device_challenge(
+    device_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    c = require_client(db, x_api_key, request=request)
+    d = db.query(Device).filter(Device.id == device_id).first()
+    if not d or str(d.client_id_fk) != str(c.id) or d.is_revoked:
+        raise HTTPException(status_code=404, detail="device_not_found")
+    nonce = secrets.token_urlsafe(32)
+    db.add(DeviceChallenge(device_id_fk=d.id, nonce=nonce))
+    db.commit()
+    return DeviceChallengeResponse(device_id=str(d.id), nonce=nonce, note="ok")
+
+@app.post("/devices/heartbeat", response_model=HeartbeatResponse)
+def device_heartbeat(
+    req: HeartbeatRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    c = require_client(db, x_api_key, request=request)
+    d = db.query(Device).filter(Device.id == req.device_id).first()
+    if not d or str(d.client_id_fk) != str(c.id) or d.is_revoked:
+        raise HTTPException(status_code=404, detail="device_not_found")
+    d.last_seen_at = datetime.utcnow()
+    d.last_capabilities = req.payload
+    db.add(d)
+    db.add(Heartbeat(device_id_fk=d.id, payload=req.payload))
+    db.commit()
+    return HeartbeatResponse(accepted=True, note="ok")
+
+
+@app.post("/devices/attest", response_model=DeviceAttestResponse)
+def device_attest(
+    req: DeviceAttestRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    c = require_client(db, x_api_key, request=request)
+    d = db.query(Device).filter(Device.id == req.device_id).first()
+    if not d or str(d.client_id_fk) != str(c.id) or d.is_revoked:
+        raise HTTPException(status_code=404, detail="device_not_found")
+    d.attestation_level = req.level
+    d.attestation_doc = req.doc
+    d.attested_at = datetime.utcnow()
+    d.last_seen_at = datetime.utcnow()
+    db.add(d)
+    db.commit()
+    return DeviceAttestResponse(accepted=True, note="ok")

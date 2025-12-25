@@ -1,13 +1,16 @@
 import 'dart:async';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'gmf_server_status.dart';
-import '../capabilities/gmf_capabilities.dart';
+import 'dart:io';
+
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
-import 'gmf_android_permissions.dart';
-import 'gmf_fgs_controller.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+import '../capabilities/gmf_capabilities.dart';
 import '../capabilities/gmf_heartbeat.dart';
 import '../ffi/gmf_worker.dart';
-
+import 'gmf_android_permissions.dart';
+import 'gmf_interval_policy.dart';
+import 'gmf_server_status.dart';
+import 'gmf_fgs_controller.dart';
 
 const _storage = FlutterSecureStorage();
 const _apiKeyStorageKey = 'gmf_api_key';
@@ -19,44 +22,20 @@ Future<String> _apiBase() async {
   return (v == null || v.isEmpty) ? 'http://localhost:8000' : v;
 }
 
-/// TODO: 你把這個函數接到你現有的 GMF worker：
-///   - (已做) ensure device identity loaded into Rust
-///   - (已做) heartbeat + signed report
-///   - 你只需要在這裡呼叫「跑一輪」：lease->execute->report
-Future<void> gmfRunOneIteration() async {
-  // 1) probe capabilities -> adjust interval if needed
-  final cap = await GmfCapabilities.probe();
-  final desired = _GmfTaskHandler()._computeIntervalSec(cap); // temp helper use (cheap)
-  // NOTE: real interval is maintained in handler; we will update via notification only here.
-
-  // 2) 更新 capability heartbeat（server dispatch 需要最新）
+/// One iteration: probe cap -> heartbeat -> runOnce (lease->execute->signed report)
+Future<bool> gmfRunOneIteration() async {
+  // Keep server dispatch aware (battery/network/thermal)
   await GmfHeartbeat.sendOnce();
 
-  // 3) 跑一輪：lease -> execute -> signed report
   final apiKey = await _apiKey();
-  if (apiKey == null || apiKey.isEmpty) return;
+  if (apiKey == null || apiKey.isEmpty) return false;
   final apiBase = await _apiBase();
 
   final worker = GmfWorkerFFI(GmfWorkerFFI.openNative());
   final ok = worker.runOnce(apiBase, apiKey);
-
-  // 4) 通知更新（credits/risk + last status）
-  final note = ok ? 'ok interval~${desired}s' : 'fail interval~${desired}s';
-  try {
-    await fetchMe(apiBase, apiKey); // warm call; real update below
-    FlutterForegroundTask.updateService(
-      notificationTitle: 'Global Math Fabric running',
-      notificationText: note,
-    );
-  } catch (_) {
-    FlutterForegroundTask.updateService(
-      notificationTitle: 'Global Math Fabric running',
-      notificationText: note,
-    );
-  }
+  return ok;
 }
 
-/// Foreground task entrypoint
 @pragma('vm:entry-point')
 void gmfForegroundStartCallback() {
   FlutterForegroundTask.setTaskHandler(_GmfTaskHandler());
@@ -65,85 +44,108 @@ void gmfForegroundStartCallback() {
 class _GmfTaskHandler extends TaskHandler {
   bool _running = false;
   int _intervalSec = 3;
-  String _lastNote = 'boot';
+  Timer? _timer;
 
-  int _computeIntervalSec(Map<String, dynamic> cap) {
-    final battery = (cap['battery_pct'] is num) ? (cap['battery_pct'] as num).toDouble() : 100.0;
-    final charging = cap['charging'] == true;
-    final net = (cap['network_type'] ?? 'wifi').toString().toLowerCase();
-    final thermal = (cap['thermal'] ?? 'nominal').toString().toLowerCase();
-
-    // Conservative ladder:
-    // - best: charging + wifi + nominal/fair => 3s
-    // - ok: wifi + not critical => 10s
-    // - low power/heat/cellular => 30s
-    // - very low battery and not charging => 60s
-    if (thermal == 'critical' || thermal == 'serious') return 30;
-    if (!charging && battery < 15) return 60;
-    if (net != 'wifi' && net != 'ethernet') return 30;
-    if (charging && (net == 'wifi' || net == 'ethernet') && (thermal == 'nominal' || thermal == 'fair')) return 3;
-    if (net == 'wifi' || net == 'ethernet') return 10;
-    return 30;
-  }
-
-  Future<void> _updateNotification(String apiBase, String apiKey, String note) async {
-    try {
-      final me = await fetchMe(apiBase, apiKey);
-      final credits = me?.creditsTotal ?? 0;
-      final risk = me?.riskScore ?? 0.0;
-      FlutterForegroundTask.updateService(
-        notificationTitle: 'Global Math Fabric running',
-        notificationText: 'credits=$credits  risk=${risk.toStringAsFixed(1)}  $note',
-      );
-    } catch (_) {
-      FlutterForegroundTask.updateService(
-        notificationTitle: 'Global Math Fabric running',
-        notificationText: note,
-      );
-    }
-  }
+  // notification /me polling throttle
+  DateTime _lastMeFetch = DateTime.fromMillisecondsSinceEpoch(0);
+  int _cachedCredits = 0;
+  double _cachedRisk = 0.0;
 
   void _armTimer() {
     _timer?.cancel();
     _timer = Timer.periodic(Duration(seconds: _intervalSec), (_) async {
       if (_running) return;
       _running = true;
-      try { await gmfRunOneIteration(); } catch (_) {}
-      _running = false;
+      try {
+        await _tick();
+      } finally {
+        _running = false;
+      }
     });
   }
 
+  Future<void> _maybeUpdateMe(String apiBase, String apiKey) async {
+    final now = DateTime.now();
+    if (now.difference(_lastMeFetch).inSeconds < 30) return;
+    _lastMeFetch = now;
+    final me = await fetchMe(apiBase, apiKey);
+    if (me != null) {
+      _cachedCredits = me.creditsTotal;
+      _cachedRisk = me.riskScore;
+    }
+  }
 
+  Future<void> _notify(String text) async {
+    FlutterForegroundTask.updateService(
+      notificationTitle: 'Global Math Fabric running',
+      notificationText: text,
+    );
+  }
 
-  @override
-  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+  Future<void> _tick() async {
+    // Gate on persisted toggle (enables autoRunOnBoot safely)
     final enabled = await GmfFgsController.isEnabled();
     if (!enabled) {
       try { await FlutterForegroundTask.stopService(); } catch (_) {}
       return;
     }
-    // 立刻跑一輪，並啟動自適應循環
+
+    // Probe capabilities and adapt interval
+    final cap = await GmfCapabilities.probe();
+    final desired = GmfIntervalPolicy.computeIntervalSec(cap);
+    if (desired != _intervalSec) {
+      _intervalSec = desired;
+      _armTimer();
+    }
+
+    // Run one iteration
+    bool ok = false;
     try {
-      final cap = await GmfCapabilities.probe();
-      _intervalSec = _computeIntervalSec(cap);
+      ok = await gmfRunOneIteration();
+    } catch (_) {
+      ok = false;
+    }
 
-      final apiKey = await _apiKey();
-      final apiBase = await _apiBase();
-      if (apiKey != null) {
-        await _updateNotification(apiBase, apiKey, 'interval=${_intervalSec}s start');
-      }
-      await gmfRunOneIteration();
-    } catch (_) {}
+    // Update notification with credits/risk (throttled)
+    final apiKey = await _apiKey();
+    final apiBase = await _apiBase();
+    if (apiKey != null && apiKey.isNotEmpty) {
+      try { await _maybeUpdateMe(apiBase, apiKey); } catch (_) {}
+    }
 
+    final net = (cap['network_type'] ?? 'wifi').toString();
+    final batt = (cap['battery_pct'] ?? 0).toString();
+    final chg = (cap['charging'] == true) ? 'chg' : 'bat';
+    final therm = (cap['thermal'] ?? 'nominal').toString();
+
+    final status = ok ? 'ok' : 'fail';
+    await _notify('credits=$_cachedCredits risk=${_cachedRisk.toStringAsFixed(1)}  ${status}  int=${_intervalSec}s  $chg=$batt%  net=$net  th=$therm');
+  }
+
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    // Android only
+    if (!Platform.isAndroid) return;
+
+    // If toggle is off, stop immediately (boot auto-run safe)
+    final enabled = await GmfFgsController.isEnabled();
+    if (!enabled) {
+      try { await FlutterForegroundTask.stopService(); } catch (_) {}
+      return;
+    }
+
+    await _notify('starting...');
+    // First tick immediately then arm periodic
+    if (!_running) {
+      _running = true;
+      try { await _tick(); } finally { _running = false; }
+    }
     _armTimer();
   }
 
   @override
   Future<void> onRepeatEvent(DateTime timestamp) async {
-    if (_running) return;
-    _running = true;
-    try { await gmfRunOneIteration(); } catch (_) {}
-    _running = false;
+    // plugin repeat event; we already have timer, so ignore
   }
 
   @override
@@ -153,16 +155,18 @@ class _GmfTaskHandler extends TaskHandler {
   }
 
   @override
-  void onNotificationButtonPressed(String id) {}
-
-  @override
   void onNotificationPressed() {
     FlutterForegroundTask.launchApp("/");
   }
+
+  @override
+  void onNotificationButtonPressed(String id) {}
 }
 
-/// 供 UI 呼叫：啟動前台服務（Android 可做到近似 24/7，iOS 不行）
+/// Public API
 Future<void> gmfStartForegroundService() async {
+  if (!Platform.isAndroid) return;
+
   await gmfRequestAndroidNotificationPermission();
 
   FlutterForegroundTask.init(
@@ -177,10 +181,9 @@ Future<void> gmfStartForegroundService() async {
         resPrefix: ResourcePrefix.ic,
         name: 'launcher',
       ),
-      buttons: const [],
     ),
     foregroundTaskOptions: const ForegroundTaskOptions(
-      interval: 3000,
+      interval: 3000, // plugin repeat; our timer controls real work frequency
       isOnceEvent: false,
       autoRunOnBoot: true,
       allowWakeLock: true,
@@ -190,11 +193,12 @@ Future<void> gmfStartForegroundService() async {
 
   await FlutterForegroundTask.startService(
     notificationTitle: 'Global Math Fabric running',
-    notificationText: 'Contributing compute (tap to open)',
+    notificationText: 'initializing...',
     callback: gmfForegroundStartCallback,
   );
 }
 
 Future<void> gmfStopForegroundService() async {
+  if (!Platform.isAndroid) return;
   await FlutterForegroundTask.stopService();
 }
