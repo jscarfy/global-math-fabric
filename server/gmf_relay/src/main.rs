@@ -7,7 +7,7 @@ use std::{
     env, fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -21,7 +21,7 @@ use tempfile::tempdir;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct TaskSpec {
-    protocol: String,                 // "gmf/task/v1"
+    protocol: String,
     task_id: String,
     kind: String,
     params: Value,
@@ -31,7 +31,7 @@ struct TaskSpec {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PullRequest {
-    protocol: String,                 // "gmf/task_pull/v1"
+    protocol: String,
     consent_token_json: String,
     device_pubkey_b64: String,
     device_sig_b64: String,
@@ -40,11 +40,11 @@ struct PullRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SubmitRequest {
-    protocol: String,                 // "gmf/task_submit/v1"
+    protocol: String,
     consent_token_json: String,
     device_pubkey_b64: String,
     device_sig_b64: String,
-    submit_payload: Value,            // { task_id, result_core, completed_at }
+    submit_payload: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,9 +78,9 @@ struct Submission {
 #[derive(Clone)]
 struct AppState {
     tasks: Arc<Mutex<Vec<TaskSpec>>>,
-    assigned: Arc<Mutex<HashMap<String, Lease>>>,      // lease_key = "{task_id}::{device_id}"
-    completed: Arc<Mutex<HashSet<String>>>,            // task_id done
-    submissions: Arc<Mutex<HashMap<String, Vec<Submission>>>>, // task_id -> submissions
+    assigned: Arc<Mutex<HashMap<String, Lease>>>,      // lease_key "{task_id}::{device_id}"
+    completed: Arc<Mutex<HashSet<String>>>,
+    submissions: Arc<Mutex<HashMap<String, Vec<Submission>>>>,
 }
 
 fn unix_now() -> u64 {
@@ -132,9 +132,7 @@ fn load_tasks_from_jsonl(path: &str) -> anyhow::Result<Vec<TaskSpec>> {
         let t = line.trim();
         if t.is_empty() { continue; }
         let spec: TaskSpec = serde_json::from_str(t)?;
-        if spec.protocol == "gmf/task/v1" {
-            out.push(spec);
-        }
+        if spec.protocol == "gmf/task/v1" { out.push(spec); }
     }
     Ok(out)
 }
@@ -164,23 +162,6 @@ fn append_ssr(ssr: &ServerSignedReceipt) -> Result<(), (axum::http::StatusCode, 
     Ok(())
 }
 
-
-fn normalize_result_core(task: &TaskSpec, result_core: &Value) -> Value {
-    // if require_artifact_hash=false: ignore artifacts_manifest_sha256/count/log hash for agreement
-    let require_hash = task.params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
-    if require_hash {
-        return result_core.clone();
-    }
-    let ok = result_core.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-    let exit_code = result_core.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(9999);
-    let docker_image = result_core.get("docker_image").cloned().unwrap_or(Value::String("".into()));
-    serde_json::json!({
-        "ok": ok,
-        "exit_code": exit_code,
-        "docker_image": docker_image
-    })
-}
-
 fn run_cmd(mut cmd: Command) -> anyhow::Result<(i32, String)> {
     let out = cmd.output()?;
     let code = out.status.code().unwrap_or(1);
@@ -190,50 +171,19 @@ fn run_cmd(mut cmd: Command) -> anyhow::Result<(i32, String)> {
     Ok((code, s))
 }
 
-fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<Value> {
-    let params = &task.params;
-    let git_url = params.get("git_url").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing git_url"))?;
-    let rev = params.get("rev").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing rev"))?;
-    let subdir = params.get("subdir").and_then(|v| v.as_str()).unwrap_or("");
-    let use_cache = params.get("use_mathlib_cache").and_then(|v| v.as_bool()).unwrap_or(true);
-    let artifacts_root = params.get("artifacts_root").and_then(|v| v.as_str()).unwrap_or(".lake/build/lib");
-    let docker_image = params.get("docker_image").and_then(|v| v.as_str())
-        .unwrap_or(&env::var("GMF_LEAN_IMAGE").unwrap_or_else(|_| "leanprovercommunity/lean:latest".into()));
+fn sha256_file_hex(p: &Path) -> anyhow::Result<String> {
+    if !p.exists() { return Ok("".into()); }
+    let bytes = fs::read(p)?;
+    Ok(hex::encode(sha256(&bytes)))
+}
 
-    let require_artifact_hash = params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+fn git_rev_parse(repo: &Path, spec: &str) -> anyhow::Result<String> {
+    let (code, out) = run_cmd(Command::new("git").args(["rev-parse", spec]).current_dir(repo))?;
+    if code != 0 { return Err(anyhow::anyhow!("git rev-parse failed ({spec}): {out}")); }
+    Ok(out.trim().to_string())
+}
 
-    let require_digest = params.get("require_digest").and_then(|v| v.as_bool()).unwrap_or(true);
-    if require_digest && !docker_image.contains("@sha256:") {
-        return Ok(serde_json::json!({
-            "ok": false,
-            "exit_code": 3,
-            "build_log_sha256": hex::encode(sha256(b"docker_image_not_digest_pinned")),
-            "artifacts_root": artifacts_root,
-            "artifacts_count": 0,
-            "artifacts_manifest_sha256": "",
-            "docker_image": docker_image
-        }));
-    }
-
-    let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned()
-        .unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
-    let cmd_vec: Vec<String> = cmd_arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-    if cmd_vec.is_empty() { return Err(anyhow::anyhow!("empty cmd")); }
-
-    let dir = tempdir()?;
-    let repo = dir.path().join("repo");
-    fs::create_dir_all(&repo)?;
-
-    run_cmd(Command::new("git").arg("init").current_dir(&repo))?;
-    run_cmd(Command::new("git").args(["remote","add","origin", git_url]).current_dir(&repo))?;
-    run_cmd(Command::new("git").args(["fetch","--depth","1","origin", rev]).current_dir(&repo))?;
-    run_cmd(Command::new("git").args(["checkout","FETCH_HEAD"]).current_dir(&repo))?;
-
-    let workdir = if subdir.is_empty() { repo.clone() } else { repo.join(subdir) };
-    if !workdir.exists() {
-        return Err(anyhow::anyhow!("subdir does not exist: {}", workdir.display()));
-    }
-
+fn docker_build_and_hash(repo: &Path, subdir: &str, artifacts_root: &str, docker_image: &str, use_cache: bool, cmd_vec: &[String], require_artifact_hash: bool) -> anyhow::Result<Value> {
     let bash = format!(r#"
 set +e
 cd /workspace/{subdir}
@@ -274,9 +224,9 @@ exit 0
         subdir=subdir,
         artifacts_root=artifacts_root,
         docker_image=docker_image,
-        cmd=" ".join(cmd_vec),
-        cache_cmd="lake exe cache get &&" if use_cache else "",
-        require_hash="true" if require_artifact_hash else "false",
+        cmd=cmd_vec.join(" "),
+        cache_cmd= if use_cache { "lake exe cache get &&" } else { "" },
+        require_hash= if require_artifact_hash { "true" } else { "false" },
     );
 
     let (code, log) = run_cmd(
@@ -287,6 +237,7 @@ exit 0
             .arg(docker_image)
             .arg("bash").arg("-lc").arg(bash)
     )?;
+
     if code != 0 {
         return Ok(serde_json::json!({
             "ok": false,
@@ -305,11 +256,130 @@ exit 0
     Ok(v)
 }
 
+fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<Value> {
+    let params = &task.params;
+    let git_url = params.get("git_url").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing git_url"))?;
+    let rev = params.get("rev").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing rev"))?;
+    let subdir = params.get("subdir").and_then(|v| v.as_str()).unwrap_or("");
+    let use_cache = params.get("use_mathlib_cache").and_then(|v| v.as_bool()).unwrap_or(true);
+    let artifacts_root = params.get("artifacts_root").and_then(|v| v.as_str()).unwrap_or(".lake/build/lib");
+
+    let docker_image = params.get("docker_image").and_then(|v| v.as_str())
+        .unwrap_or(&env::var("GMF_LEAN_IMAGE").unwrap_or_else(|_| "leanprovercommunity/lean:latest".into()));
+    let require_digest = params.get("require_digest").and_then(|v| v.as_bool()).unwrap_or(true);
+    if require_digest && !docker_image.contains("@sha256:") {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "exit_code": 3,
+            "build_log_sha256": hex::encode(sha256(b"docker_image_not_digest_pinned")),
+            "artifacts_root": artifacts_root,
+            "artifacts_count": 0,
+            "artifacts_manifest_sha256": "",
+            "docker_image": docker_image,
+            "git_rev": "",
+            "git_tree": "",
+            "lean_toolchain_sha256": "",
+            "lakefile_sha256": "",
+            "lake_manifest_sha256": ""
+        }));
+    }
+
+    let require_artifact_hash = params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+    let require_source_hash = params.get("require_source_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned()
+        .unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
+    let cmd_vec: Vec<String> = cmd_arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+    if cmd_vec.is_empty() { return Err(anyhow::anyhow!("empty cmd")); }
+
+    // clone
+    let dir = tempdir()?;
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo)?;
+
+    run_cmd(Command::new("git").arg("init").current_dir(&repo))?;
+    run_cmd(Command::new("git").args(["remote","add","origin", git_url]).current_dir(&repo))?;
+    run_cmd(Command::new("git").args(["fetch","--depth","1","origin", rev]).current_dir(&repo))?;
+    run_cmd(Command::new("git").args(["checkout","FETCH_HEAD"]).current_dir(&repo))?;
+
+    let workdir = if subdir.is_empty() { repo.clone() } else { repo.join(subdir) };
+    if !workdir.exists() { return Err(anyhow::anyhow!("subdir does not exist")); }
+
+    let (git_rev, git_tree, lean_toolchain_sha256, lakefile_sha256, lake_manifest_sha256) = if require_source_hash {
+        let git_rev = git_rev_parse(&repo, "HEAD")?;
+        let git_tree = git_rev_parse(&repo, "HEAD^{tree}")?;
+
+        let lean_toolchain_sha256 = sha256_file_hex(&workdir.join("lean-toolchain"))?;
+        let lake_manifest_sha256 = sha256_file_hex(&workdir.join("lake-manifest.json"))?;
+        let lakefile_sha256 = if workdir.join("Lakefile.lean").exists() {
+            sha256_file_hex(&workdir.join("Lakefile.lean"))?
+        } else {
+            sha256_file_hex(&workdir.join("lakefile.lean"))?
+        };
+
+        (git_rev, git_tree, lean_toolchain_sha256, lakefile_sha256, lake_manifest_sha256)
+    } else {
+        ("".into(),"".into(),"".into(),"".into(),"".into())
+    };
+
+    let mut partial = docker_build_and_hash(&repo, subdir, artifacts_root, docker_image, use_cache, &cmd_vec, require_artifact_hash)?;
+
+    if require_source_hash {
+        partial.as_object_mut().unwrap().insert("git_rev".into(), Value::String(git_rev));
+        partial.as_object_mut().unwrap().insert("git_tree".into(), Value::String(git_tree));
+        partial.as_object_mut().unwrap().insert("lean_toolchain_sha256".into(), Value::String(lean_toolchain_sha256));
+        partial.as_object_mut().unwrap().insert("lakefile_sha256".into(), Value::String(lakefile_sha256));
+        partial.as_object_mut().unwrap().insert("lake_manifest_sha256".into(), Value::String(lake_manifest_sha256));
+    } else {
+        partial.as_object_mut().unwrap().insert("git_rev".into(), Value::String("".into()));
+        partial.as_object_mut().unwrap().insert("git_tree".into(), Value::String("".into()));
+        partial.as_object_mut().unwrap().insert("lean_toolchain_sha256".into(), Value::String("".into()));
+        partial.as_object_mut().unwrap().insert("lakefile_sha256".into(), Value::String("".into()));
+        partial.as_object_mut().unwrap().insert("lake_manifest_sha256".into(), Value::String("".into()));
+    }
+
+    Ok(partial)
+}
+
+fn normalize_result_core(task: &TaskSpec, result_core: &Value) -> Value {
+    let require_artifact_hash = task.params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+    let require_source_hash = task.params.get("require_source_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let ok = result_core.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let exit_code = result_core.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(9999);
+
+    let docker_image = result_core.get("docker_image").cloned().unwrap_or(Value::String("".into()));
+
+    let mut obj = serde_json::json!({
+        "ok": ok,
+        "exit_code": exit_code,
+        "docker_image": docker_image
+    });
+
+    if require_artifact_hash {
+        obj.as_object_mut().unwrap().insert("build_log_sha256".into(),
+            result_core.get("build_log_sha256").cloned().unwrap_or(Value::String("".into())));
+        obj.as_object_mut().unwrap().insert("artifacts_root".into(),
+            result_core.get("artifacts_root").cloned().unwrap_or(Value::String("".into())));
+        obj.as_object_mut().unwrap().insert("artifacts_count".into(),
+            result_core.get("artifacts_count").cloned().unwrap_or(Value::Number(0.into())));
+        obj.as_object_mut().unwrap().insert("artifacts_manifest_sha256".into(),
+            result_core.get("artifacts_manifest_sha256").cloned().unwrap_or(Value::String("".into())));
+    }
+
+    if require_source_hash {
+        for k in ["git_rev","git_tree","lean_toolchain_sha256","lakefile_sha256","lake_manifest_sha256"] {
+            obj.as_object_mut().unwrap().insert(k.into(),
+                result_core.get(k).cloned().unwrap_or(Value::String("".into())));
+        }
+    }
+
+    obj
+}
+
 async fn pull_task(state: axum::extract::State<AppState>, Json(req): Json<PullRequest>)
 -> Result<Json<PullResponse>, (axum::http::StatusCode, String)> {
-    if req.protocol != "gmf/task_pull/v1" {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "bad protocol".into()));
-    }
+    if req.protocol != "gmf/task_pull/v1" { return Err((axum::http::StatusCode::BAD_REQUEST, "bad protocol".into())); }
 
     verify_device_sig_over_payload(&req.device_pubkey_b64, &req.pull_payload, &req.device_sig_b64)
         .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e.to_string()))?;
@@ -327,10 +397,8 @@ async fn pull_task(state: axum::extract::State<AppState>, Json(req): Json<PullRe
     let mut assigned = state.assigned.lock().unwrap();
     let completed = state.completed.lock().unwrap();
 
-    // cleanup expired leases
     assigned.retain(|_, lease| lease.expires_at_unix > now);
 
-    // pick first not-completed; allow up to replicas leases; avoid same device twice
     for t in tasks.iter() {
         if completed.contains(&t.task_id) { continue; }
 
@@ -358,9 +426,7 @@ async fn pull_task(state: axum::extract::State<AppState>, Json(req): Json<PullRe
 
 async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<SubmitRequest>)
 -> Result<Json<ServerSignedReceipt>, (axum::http::StatusCode, String)> {
-    if req.protocol != "gmf/task_submit/v1" {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "bad protocol".into()));
-    }
+    if req.protocol != "gmf/task_submit/v1" { return Err((axum::http::StatusCode::BAD_REQUEST, "bad protocol".into())); }
 
     verify_device_sig_over_payload(&req.device_pubkey_b64, &req.submit_payload, &req.device_sig_b64)
         .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e.to_string()))?;
@@ -379,19 +445,16 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
         .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "missing result_core".into()))?
         .clone();
 
-    // must have had a lease
     let mut assigned = state.assigned.lock().unwrap();
     let lease_key = format!("{}::{}", task_id, device_id);
     if assigned.remove(&lease_key).is_none() {
         return Err((axum::http::StatusCode::CONFLICT, "no active lease for this device".into()));
     }
 
-    // locate task
     let tasks = state.tasks.lock().unwrap();
     let task = tasks.iter().find(|t| t.task_id == task_id).cloned()
         .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "unknown task_id".into()))?;
 
-    // append submission
     let mut subs_map = state.submissions.lock().unwrap();
     let subs = subs_map.entry(task.task_id.clone()).or_insert_with(Vec::new);
 
@@ -405,19 +468,20 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
         received_at: Utc::now().to_rfc3339(),
     });
 
-    // need enough replicas
     let needed = task.replicas.max(1) as usize;
     if subs.len() < needed {
         return Err((axum::http::StatusCode::ACCEPTED, format!("received {}/{} submissions; waiting", subs.len(), needed)));
     }
 
-    // bucket by canonical hash of result_core
+    // bucket by normalized result_core
     let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+    let mut exemplar_by_hash: HashMap<String, Value> = HashMap::new();
     for s in subs.iter() {
         let norm = normalize_result_core(&task, &s.result_core);
         let canon = jcs_canonicalize(&norm);
         let h = hex::encode(sha256(&canon));
-        buckets.entry(h).or_default().push(s.device_id.clone());
+        buckets.entry(h.clone()).or_default().push(s.device_id.clone());
+        exemplar_by_hash.entry(h).or_insert(norm);
     }
 
     let (agree_hash, winners) = buckets.into_iter()
@@ -430,38 +494,30 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     let mut spot = serde_json::json!({"performed": do_spot});
 
     let mut spot_result_core: Option<Value> = None;
-    let mut spot_ok: Option<bool> = None;
-    let mut spot_exit: Option<i32> = None;
-    let mut spot_log_hash: Option<String> = None;
-
     if do_spot && task.kind == "lean_check" {
         match spotcheck_lean(&task) {
             Ok(rcore) => {
-                spot_result_core = Some(rcore.clone());
-                spot_ok = rcore.get("ok").and_then(|v| v.as_bool());
-                spot_exit = rcore.get("exit_code").and_then(|v| v.as_i64()).map(|x| x as i32);
-                spot_log_hash = rcore.get("build_log_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
-                spot["result_core"] = rcore;
+                spot["result_core"] = rcore.clone();
+                spot_result_core = Some(rcore);
             }
             Err(e) => {
-                // inconclusive: do not penalize
                 spot["inconclusive"] = Value::Bool(true);
                 spot["error"] = Value::String(e.to_string());
             }
         }
     }
 
-    // mark completed now (immutable decision point)
+    // mark completed
     let mut completed = state.completed.lock().unwrap();
     completed.insert(task.task_id.clone());
 
     let per_device = (task.credit_micro_total / task.replicas.max(1)) as i64;
 
-    // compare spot-check with agreed result (only if spot had a conclusive ok/exit_code)
+    // fraud compare: normalized(spot) vs normalized(agreed exemplar)
+    let agreed_exemplar = exemplar_by_hash.get(&agree_hash).cloned().unwrap_or_else(|| normalize_result_core(&task, &result_core));
     let fraud = if let Some(spot_core) = spot_result_core.as_ref() {
-        let a = normalize_result_core(&task, &result_core);
         let b = normalize_result_core(&task, spot_core);
-        a != b
+        agreed_exemplar != b
     } else {
         false
     };
@@ -472,7 +528,6 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     let server_sk_b64 = env::var("GMF_SERVER_SK_B64")
         .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing GMF_SERVER_SK_B64".into()))?;
 
-    // helper: issue SSR for a specific device
     let issue_for = |dev_id: &str, delta: i64, reason: &str, fraud_flag: bool|
         -> Result<ServerSignedReceipt, (axum::http::StatusCode, String)> {
         let receipt_payload = serde_json::json!({
@@ -488,6 +543,7 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
             "reason_code": reason,
             "fraud_flag": fraud_flag,
             "spotcheck": spot,
+            "normalized_agreed_result_core": agreed_exemplar,
             "issued_at": Utc::now().to_rfc3339()
         });
         let (server_pubkey_b64, server_sig_b64) =
@@ -501,17 +557,15 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
         })
     };
 
-    // If fraud, penalize ALL winners now (negative credits), else reward all winners now.
     if fraud {
         for dev in winners.iter() {
             let ssr = issue_for(dev, -per_device, "spotcheck_failed", true)?;
             append_ssr(&ssr)?;
         }
-        // Return to caller their fraud SSR (already appended), so also just compute it again:
         let my = issue_for(&device_id, -per_device, "spotcheck_failed", true)?;
         return Ok(Json(my));
     } else {
-        let reason = if do_spot && spot_ok.is_some() { "replica_agreement_spotcheck_ok" } else { "replica_agreement" };
+        let reason = if do_spot && spot_result_core.is_some() { "replica_agreement_spotcheck_ok" } else { "replica_agreement" };
         for dev in winners.iter() {
             let ssr = issue_for(dev, per_device, reason, false)?;
             append_ssr(&ssr)?;
@@ -545,7 +599,7 @@ async fn main() -> anyhow::Result<()> {
     let host = env::var("GMF_RELAY_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = env::var("GMF_RELAY_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8787);
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
-    eprintln!("gmf_relay(spotcheck) listening on http://{addr}");
+    eprintln!("gmf_relay listening on http://{addr}");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
 }
