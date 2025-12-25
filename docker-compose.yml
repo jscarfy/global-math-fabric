@@ -63,6 +63,8 @@ volumes:
       - GMF_MIN_MEM_GB_FOR_HEAVY=16
       - GMF_REQUIRE_GPU_FOR_HEAVY=false
       - GMF_HEAVY_WORK_ITERS=5000000
+      - GMF_HEAVY_PROOF_AUDIT_RATE=0.01
+      - GMF_HEAVY_PROOF_MAX_ITERS_VERIFY=2000000
     build:
       context: .
       dockerfile: verifier-rs/Dockerfile

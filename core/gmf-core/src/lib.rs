@@ -296,3 +296,102 @@ fn compute_work_proof(instance_id: &str, stdout_sha256: &str, iters: u64) -> (u6
     }
     (iters, hex::encode(state))
 }
+
+
+#[derive(Clone, Debug)]
+enum HeavyWorkKind {
+    Sha256Chain,
+    PolyMod,
+}
+
+#[derive(Clone, Debug)]
+struct HeavyWorkSpec {
+    kind: HeavyWorkKind,
+    iters: u64,
+    // params are kept minimal (deterministic, small)
+    // PolyMod params:
+    mod_p: u64,
+    a: u64,
+    b: u64,
+    x0: u64,
+}
+
+fn parse_heavy_work_spec(manifest: &serde_json::Value) -> HeavyWorkSpec {
+    // Defaults:
+    let mut kind = HeavyWorkKind::Sha256Chain;
+    let mut iters = heavy_work_iters();
+    let mut mod_p: u64 = 1_000_000_007;
+    let mut a: u64 = 48271;
+    let mut b: u64 = 0;
+    let mut x0: u64 = 1;
+
+    if let Some(hw) = manifest.get("heavy_work") {
+        if let Some(k) = hw.get("kind").and_then(|v| v.as_str()) {
+            kind = match k {
+                "poly_mod" => HeavyWorkKind::PolyMod,
+                _ => HeavyWorkKind::Sha256Chain,
+            };
+        }
+        if let Some(n) = hw.get("iters").and_then(|v| v.as_u64()) {
+            iters = n;
+        }
+        if let Some(p) = hw.get("params") {
+            if let Some(v) = p.get("mod_p").and_then(|v| v.as_u64()) { mod_p = v; }
+            if let Some(v) = p.get("a").and_then(|v| v.as_u64()) { a = v; }
+            if let Some(v) = p.get("b").and_then(|v| v.as_u64()) { b = v; }
+            if let Some(v) = p.get("x0").and_then(|v| v.as_u64()) { x0 = v; }
+        }
+    }
+
+    HeavyWorkSpec { kind, iters, mod_p, a, b, x0 }
+}
+
+fn compute_heavy_work_proof(instance_id: &str, stdout_sha256: &str, spec: &HeavyWorkSpec) -> (String, serde_json::Value) {
+    match spec.kind {
+        HeavyWorkKind::Sha256Chain => {
+            let (n, digest) = compute_work_proof(instance_id, stdout_sha256, spec.iters);
+            ("sha256_chain".to_string(), serde_json::json!({"iters": n, "digest": digest}))
+        }
+        HeavyWorkKind::PolyMod => {
+            // deterministic modular recurrence: x_{t+1} = (a*x_t + b + seed) mod p
+            // seed derived from instance_id + stdout_sha256 (stable)
+            use sha2::{Sha256, Digest};
+            let mut seed_in = Vec::new();
+            seed_in.extend_from_slice(instance_id.as_bytes());
+            seed_in.extend_from_slice(b"|");
+            seed_in.extend_from_slice(stdout_sha256.as_bytes());
+            let seed = Sha256::digest(&seed_in);
+            // take first 8 bytes as u64
+            let mut seed_u64: u64 = 0;
+            for i in 0..8 { seed_u64 = (seed_u64 << 8) | (seed[i] as u64); }
+
+            let p = spec.mod_p.max(3);
+            let a = spec.a % p;
+            let b = spec.b % p;
+            let mut x = spec.x0 % p;
+
+            for _ in 0..spec.iters {
+                x = (a.wrapping_mul(x) + b + (seed_u64 % p)) % p;
+            }
+
+            // digest: sha256(instance_id|stdout_sha256|x)
+            let mut h = Sha256::new();
+            h.update(instance_id.as_bytes());
+            h.update(b"|");
+            h.update(stdout_sha256.as_bytes());
+            h.update(b"|");
+            h.update(x.to_be_bytes());
+            let digest = hex::encode(h.finalize().to_vec());
+
+            ("poly_mod".to_string(), serde_json::json!({
+                "iters": spec.iters,
+                "mod_p": p,
+                "a": a,
+                "b": b,
+                "x0": spec.x0 % p,
+                "x": x,
+                "digest": digest
+            }))
+        }
+    }
+}

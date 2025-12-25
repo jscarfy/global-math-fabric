@@ -284,7 +284,72 @@ def report_instance(
         raise HTTPException(status_code=404, detail="instance_not_found")
 
     if inst.lease_token != req.lease_token:
-        return ReportResponse(accepted=False, verified_now=False, note="bad_lease_token")
+        
+    # --- heavy work proof audit (sampled) ---
+    try:
+        audit_rate = float(os.environ.get("GMF_HEAVY_PROOF_AUDIT_RATE", "0.01"))
+        max_verify = int(os.environ.get("GMF_HEAVY_PROOF_MAX_ITERS_VERIFY", "2000000"))
+        if random.random() < audit_rate:
+            # Load task manifest for this instance
+            td = db.query(TaskDef).filter(TaskDef.id == inst.task_id_fk).first() if hasattr(inst, "task_id_fk") else None
+            manifest = td.manifest if td else None
+            if manifest and manifest.get("power_profile") == "heavy":
+                wp = (req.stdout_json or {}).get("_work_proof", None)
+                if wp and isinstance(wp, dict):
+                    kind = wp.get("kind")
+                    payload = wp.get("payload") or {}
+                    # Only verify bounded-cost proofs to avoid server DoS
+                    if kind == "sha256_chain":
+                        iters = int(payload.get("iters", 0) or 0)
+                        if 0 < iters <= max_verify:
+                            import hashlib, json
+                            def canon(v):
+                                if isinstance(v, dict):
+                                    return {k: canon(v[k]) for k in sorted(v.keys())}
+                                if isinstance(v, list):
+                                    return [canon(x) for x in v]
+                                return v
+                            msg = {"instance_id": req.instance_id, "stdout_sha256": req.stdout_sha256}
+                            state = hashlib.sha256((req.instance_id + "|" + req.stdout_sha256).encode("utf-8")).digest()
+                            for _ in range(iters):
+                                state = hashlib.sha256(state).digest()
+                            digest = state.hex()
+                            if digest != str(payload.get("digest", "")):
+                                raise HTTPException(status_code=400, detail="heavy_proof_audit_failed_sha256_chain")
+                    elif kind == "poly_mod":
+                        iters = int(payload.get("iters", 0) or 0)
+                        if 0 < iters <= max_verify:
+                            import hashlib
+                            p_mod = int(payload.get("mod_p", 1000000007) or 1000000007)
+                            a = int(payload.get("a", 48271) or 48271) % p_mod
+                            b = int(payload.get("b", 0) or 0) % p_mod
+                            x0 = int(payload.get("x0", 1) or 1) % p_mod
+
+                            seed = hashlib.sha256((req.instance_id + "|" + req.stdout_sha256).encode("utf-8")).digest()
+                            seed_u64 = 0
+                            for i in range(8):
+                                seed_u64 = (seed_u64 << 8) | seed[i]
+                            x = x0
+                            for _ in range(iters):
+                                x = (a * x + b + (seed_u64 % p_mod)) % p_mod
+
+                            h = hashlib.sha256()
+                            h.update(req.instance_id.encode("utf-8"))
+                            h.update(b"|")
+                            h.update(req.stdout_sha256.encode("utf-8"))
+                            h.update(b"|")
+                            h.update(x.to_bytes(8, "big"))
+                            digest = h.hexdigest()
+                            if digest != str(payload.get("digest", "")):
+                                raise HTTPException(status_code=400, detail="heavy_proof_audit_failed_poly_mod")
+    except HTTPException:
+        raise
+    except Exception:
+        # audit failures other than explicit mismatch should not break normal flow in MVP
+        pass
+    # ----------------------------------------
+
+    return ReportResponse(accepted=False, verified_now=False, note="bad_lease_token")
     if inst.leased_by != client.client_id:
         return ReportResponse(accepted=False, verified_now=False, note="client_mismatch")
     if inst.lease_expires_at is None or inst.lease_expires_at < now:
