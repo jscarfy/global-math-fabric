@@ -1,0 +1,12 @@
+{
+  "transition_v": 1,
+  "kind": "guardian_set_transition",
+  "issued_at": "2025-12-25T14:29:57Z",
+  "old_guardian_set_id": "guardian_set_v1",
+  "new_guardian_set_id": "guardian_set_v2",
+  "new_guardian_set_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "msg": "GMF_GUARDIAN_SET_TRANSITION|old:guardian_set_v1|new:guardian_set_v2|new_set_sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|ts:2025-12-25T14:29:57Z",
+  "sig_suite": "ed25519",
+  "threshold": 2,
+  "signatures": [{"signer":"guardian-1","sig_b64":"ndtOBb8qkk0P6IHO4RccVP1oAU1PYhLaZ6azLH0Dt1G7/wM1veoncz5MnLT8TEZPEun+mjWw+/ykH8yRheAsAA=="},{"signer":"guardian-2","sig_b64":"Gd5BRUi7fvzCohjt8aRsgZiIoPOzVt6KYoHF5Boiw+9mvlIcUQ3L8r7q8CxkKPbJHzvxH2xpWKtObU6EaieWDg=="},{"signer":"guardian-3","sig_b64":"8uzRFdlpMq+wfDUe7LilBwehJzYDyqlp94s/o6rwk4xBhH+rZBbh+0iHWRx8lYdLxlj7xoIQn3XQhlbW29fvDA=="}]
+}
