@@ -79,6 +79,11 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" -t "$TAG" -n "GMF desktop release $TAG"
           find dist/updates -type f -maxdepth 2 -print -exec gh release upload "$TAG" {} --clobber \;
 
+      - name: Compute MSIX_VERSION from tag
+        run: |
+          MSIX_VERSION=$(./scripts/release/version_from_tag.sh "${GITHUB_REF_NAME}")
+          echo "MSIX_VERSION=${MSIX_VERSION}" >> $GITHUB_ENV
+
       - name: Generate appcast.xml (Sparkle tool if present, else keep existing)
         run: |
           mkdir -p releases
