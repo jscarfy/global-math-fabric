@@ -87,3 +87,14 @@ class DeviceIdentity {
     return d;
   }
 }
+
+extension DeviceIdentityRegister on DeviceIdentity {
+  static Future<String> signRegister({required String accountId, required String devicePubkeyHex}) async {
+    final id = await getOrCreate();
+    final priv = _fromHex(id["privkey_hex"]!);
+    final keyPair = SimpleKeyPairData(priv, type: KeyPairType.ed25519);
+    final msg = "gmf:register:v1:$accountId:${devicePubkeyHex.toLowerCase()}";
+    final sig = await _algo.sign(utf8.encode(msg), keyPair: keyPair);
+    return _toHex(sig.bytes);
+  }
+}
