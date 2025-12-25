@@ -481,18 +481,21 @@ def _write_audit_bundle(proof_hash: str, bundle_bytes: bytes) -> dict:
     (path.with_suffix(".meta.json")).write_bytes(_canon_json_bytes(meta))
     return meta
 
-def _lease_challenge_put(db, lease_id: str, device_id: str, job_id: str, nonce_hex: str, audit_required: bool, required_fields: list[str], ts_utc: str):
+def _lease_challenge_put(db, lease_id: str, device_id: str, job_id: str, nonce_hex: str, audit_required: bool, required_fields: list[str], ts_utc: str, seed_hex: str = "", chunk_size: int = 65536, sample_k: int = 3):
     rf = _csv_norm(",".join(required_fields))
     row = db.query(LeaseChallenge).filter(LeaseChallenge.lease_id == lease_id).first()
     if row is None:
         row = LeaseChallenge(
             lease_id=lease_id, device_id=device_id, job_id=job_id,
-            nonce_hex=nonce_hex, audit_required=1 if audit_required else 0,
-            required_fields_csv=rf, created_ts_utc=ts_utc,
+            nonce_hex=nonce_hex, seed_hex=seed_hex, chunk_size=int(chunk_size), sample_k=int(sample_k),
+            audit_required=1 if audit_required else 0, required_fields_csv=rf, created_ts_utc=ts_utc,
         )
         db.add(row)
     else:
         row.nonce_hex = nonce_hex
+        row.seed_hex = seed_hex
+        row.chunk_size = int(chunk_size)
+        row.sample_k = int(sample_k)
         row.audit_required = 1 if audit_required else 0
         row.required_fields_csv = rf
         row.created_ts_utc = ts_utc
@@ -500,3 +503,65 @@ def _lease_challenge_put(db, lease_id: str, device_id: str, job_id: str, nonce_h
 
 def _lease_challenge_get(db, lease_id: str):
     return db.query(LeaseChallenge).filter(LeaseChallenge.lease_id == lease_id).first()
+
+GMF_MERKLE_CHUNK_SIZE = int(os.environ.get('GMF_MERKLE_CHUNK_SIZE','65536'))
+
+GMF_AUDIT_SAMPLE_K = int(os.environ.get('GMF_AUDIT_SAMPLE_K','3'))
+
+GMF_AUDIT_MIN_CHUNKS = int(os.environ.get('GMF_AUDIT_MIN_CHUNKS','16'))
+
+GMF_AUDIT_TRANSCRIPTS_DIR = os.environ.get('GMF_AUDIT_TRANSCRIPTS_DIR','ledger/audit_transcripts')
+
+def _sha256(b: bytes) -> bytes:
+    return hashlib.sha256(b).digest()
+
+def _hx(b: bytes) -> str:
+    return b.hex()
+
+def _unhex(h: str) -> bytes:
+    return bytes.fromhex(h.strip().lower())
+
+def _merkle_parent(left: bytes, right: bytes) -> bytes:
+    return _sha256(left + right)
+
+def _merkle_verify_proof(leaf_hash: bytes, proof: list[dict], root_hex: str) -> bool:
+    cur = leaf_hash
+    for step in proof:
+        side = step.get("side")
+        sib = _unhex(step.get("h",""))
+        if side == "L":
+            cur = _merkle_parent(sib, cur)
+        elif side == "R":
+            cur = _merkle_parent(cur, sib)
+        else:
+            return False
+    return _hx(cur) == root_hex.lower()
+
+def _audit_indices(seed_hex: str, num_chunks: int, k: int) -> list[int]:
+    # deterministic indices from seed: idx_i = sha256(seed||i) mod num_chunks
+    seed = _unhex(seed_hex)
+    out = []
+    seen = set()
+    for i in range(max(1, k*3)):  # try more to get unique
+        h = _sha256(seed + i.to_bytes(4, "big"))
+        idx = int.from_bytes(h[:8], "big") % num_chunks
+        if idx not in seen:
+            out.append(idx); seen.add(idx)
+        if len(out) >= k:
+            break
+    # if still short (tiny num_chunks), allow repeats by filling
+    while len(out) < k:
+        out.append(out[-1] if out else 0)
+    return out
+
+def _audit_transcript_path(proof_hash: str) -> Path:
+    d = Path(GMF_AUDIT_TRANSCRIPTS_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{proof_hash}.json"
+
+def _write_audit_transcript(obj: dict) -> None:
+    # immutable-ish: if exists, keep
+    ph = obj.get("proof_hash","")
+    p = _audit_transcript_path(ph)
+    if not p.exists():
+        p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")

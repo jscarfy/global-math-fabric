@@ -78,6 +78,9 @@ class LeaseChallenge(Base):
     device_id = Column(String, nullable=False, index=True)
     job_id = Column(String, nullable=False, index=True)
     nonce_hex = Column(String, nullable=False)          # server-issued nonce
+    sample_k = Column(Integer, nullable=False, default=3)
+    chunk_size = Column(Integer, nullable=False, default=65536)
+    seed_hex = Column(String, nullable=False, default="")  # sha256(lease_id|nonce)
     audit_required = Column(Integer, nullable=False, default=0)  # 0/1
     required_fields_csv = Column(Text, nullable=False, default="")  # e.g. "lean_trace_hash"
     created_ts_utc = Column(String, nullable=False)
