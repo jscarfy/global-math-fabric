@@ -1676,6 +1676,68 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // auto-finalize previous month/year report anchors (write-once), after grace from period boundary
+    let report_finalize_grace_secs: u64 = env::var("GMF_REPORT_FINALIZE_GRACE_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(3600);
+    let report_finalize_interval_secs: u64 = env::var("GMF_REPORT_FINALIZE_INTERVAL_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(300);
+
+    fn prev_month_id(now: chrono::DateTime<Utc>) -> String {
+        let (y, m) = (now.year(), now.month());
+        if m == 1 { format!("{:04}-{:02}", y-1, 12) } else { format!("{:04}-{:02}", y, m-1) }
+    }
+    fn prev_year_id(now: chrono::DateTime<Utc>) -> String {
+        format!("{:04}", now.year()-1)
+    }
+    fn seconds_since_month_start(now: chrono::DateTime<Utc>) -> i64 {
+        let start = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap()
+            .and_hms_opt(0,0,0).unwrap();
+        let start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(start, Utc);
+        (now - start).num_seconds()
+    }
+    fn seconds_since_year_start(now: chrono::DateTime<Utc>) -> i64 {
+        let start = chrono::NaiveDate::from_ymd_opt(now.year(), 1, 1).unwrap()
+            .and_hms_opt(0,0,0).unwrap();
+        let start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(start, Utc);
+        (now - start).num_seconds()
+    }
+
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        loop {
+            let now = Utc::now();
+
+            // previous month
+            if seconds_since_month_start(now) >= report_finalize_grace_secs as i64 {
+                let ym = prev_month_id(now);
+                let mp = monthly_report_path(&ym);
+                if !mp.exists() {
+                    if let Ok(dates) = month_dates_utc(&ym) {
+                        if let Ok(payload) = build_report_payload("monthly", &ym, dates) {
+                            let _ = write_report_once(&mp, "monthly_final_payload", payload);
+                        }
+                    }
+                }
+            }
+
+            // previous year
+            if seconds_since_year_start(now) >= report_finalize_grace_secs as i64 {
+                let y = prev_year_id(now);
+                let yp = yearly_report_path(&y);
+                if !yp.exists() {
+                    if let Ok(dates) = year_dates_utc(&y) {
+                        if let Ok(payload) = build_report_payload("yearly", &y, dates) {
+                            let _ = write_report_once(&yp, "yearly_final_payload", payload);
+                        }
+                    }
+                }
+            }
+
+            sleep(Duration::from_secs(report_finalize_interval_secs)).await;
+        }
+    });
+
+
 
 
 
