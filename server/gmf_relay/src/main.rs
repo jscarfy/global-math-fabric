@@ -202,6 +202,19 @@ fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<Value> {
 
     let require_artifact_hash = params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
 
+    let require_digest = params.get("require_digest").and_then(|v| v.as_bool()).unwrap_or(true);
+    if require_digest && !docker_image.contains("@sha256:") {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "exit_code": 3,
+            "build_log_sha256": hex::encode(sha256(b"docker_image_not_digest_pinned")),
+            "artifacts_root": artifacts_root,
+            "artifacts_count": 0,
+            "artifacts_manifest_sha256": "",
+            "docker_image": docker_image
+        }));
+    }
+
     let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned()
         .unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
     let cmd_vec: Vec<String> = cmd_arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
