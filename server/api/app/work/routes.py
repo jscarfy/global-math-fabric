@@ -206,6 +206,9 @@ def pull_job(device_id: str, topics: str = ""):
                     transcript_sha256=str((json.loads(str(output)).get('transcript_sha256','') if str(output).strip().startswith('{') else '')),
                     pow_hash_hex=str((json.loads(str(output)).get('pow_hash_hex','') if str(output).strip().startswith('{') else '')),
                     checkpoints_root_hex=str((json.loads(str(output)).get('checkpoints_root_hex','') if str(output).strip().startswith('{') else '')),
+                    device_pubkey=str(payload.get('device_pubkey','')),
+                    device_sig=str(payload.get('device_sig','')),
+                    device_msg=str(f"gmf:v1:{job_id}:{lease_id}:{output_sha}"),
                 )
         except Exception as _e:
             # never fail submit due to ledger write; but keep logs
@@ -1834,3 +1837,19 @@ def _make_rw_eq_job_v3() -> dict:
         "challenge_pow_difficulty": 18,
         "checkpoint_indices": cp
     }
+
+
+def _verify_device_sig_v1(job_id: str, lease_id: str, output_sha256_hex: str, device_pubkey_hex: str, device_sig_hex: str) -> tuple[bool,str]:
+    try:
+        pk = bytes.fromhex(device_pubkey_hex.strip())
+        sig = bytes.fromhex(device_sig_hex.strip())
+        if len(pk) != 32 or len(sig) != 64:
+            return (False, "bad_device_key_or_sig_len")
+        msg = f"gmf:v1:{job_id}:{lease_id}:{output_sha256_hex}".encode("utf-8")
+        Ed25519PublicKey.from_public_bytes(pk).verify(sig, msg)
+        return (True, "ok")
+    except InvalidSignature:
+        return (False, "invalid_device_signature")
+    except Exception:
+        return (False, "bad_device_signature_payload")
+
