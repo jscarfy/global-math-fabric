@@ -9,32 +9,21 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use gmf_receipts::{jcs_canonicalize, sha256, sha256_hex};
 
-use num_bigint::BigUint;
-use num_traits::{One, Zero};
-
-#[derive(Debug, Deserialize)]
-struct ClaimEnvelope {
-    protocol: String,                 // "gmf/receipt/v1"
-    consent_token_json: Option<String>,
-    claim_payload: Value,             // canonicalized+hashed for device sig
-    device_pubkey_b64: String,
-    device_sig_b64: String,           // Ed25519 over sha256(JCS(claim_payload))
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct TaskSpec {
     protocol: String,                 // "gmf/task/v1"
     task_id: String,
-    kind: String,                     // "fibonacci" | "is_prime_64"
+    kind: String,
     params: Value,
-    credit_micro: i64,
+    credit_micro_total: i64,
+    replicas: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,8 +31,8 @@ struct PullRequest {
     protocol: String,                 // "gmf/task_pull/v1"
     consent_token_json: String,
     device_pubkey_b64: String,
-    device_sig_b64: String,           // sig over sha256(JCS(pull_payload))
-    pull_payload: Value,              // {requested_at, want_kind?}
+    device_sig_b64: String,
+    pull_payload: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,21 +40,21 @@ struct SubmitRequest {
     protocol: String,                 // "gmf/task_submit/v1"
     consent_token_json: String,
     device_pubkey_b64: String,
-    device_sig_b64: String,           // sig over sha256(JCS(submit_payload))
-    submit_payload: Value,            // {task_id, result, completed_at}
+    device_sig_b64: String,
+    submit_payload: Value,            // { task_id, result_core, completed_at }
 }
 
 #[derive(Debug, Serialize)]
 struct PullResponse {
-    protocol: String,                 // "gmf/task_pull_resp/v1"
+    protocol: String,
     task: Option<TaskSpec>,
     message: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ServerSignedReceipt {
-    protocol: String,                 // "gmf/ssr/v1"
-    receipt_payload: Value,           // signed below
+    protocol: String,
+    receipt_payload: Value,
     server_pubkey_b64: String,
     server_sig_b64: String,
 }
@@ -73,15 +62,22 @@ struct ServerSignedReceipt {
 #[derive(Debug, Clone)]
 struct Lease {
     device_id: String,
-    leased_at_unix: u64,
     expires_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
+struct Submission {
+    device_id: String,
+    result_core: Value, // must match exactly across replicas
+    received_at: String,
 }
 
 #[derive(Clone)]
 struct AppState {
     tasks: Arc<Mutex<Vec<TaskSpec>>>,
-    assigned: Arc<Mutex<HashMap<String, Lease>>>, // task_id -> lease
-    completed: Arc<Mutex<HashSet<String>>>,       // task_id done
+    assigned: Arc<Mutex<HashMap<String, Lease>>>,      // task_id -> lease
+    completed: Arc<Mutex<HashSet<String>>>,            // task_id done
+    submissions: Arc<Mutex<HashMap<String, Vec<Submission>>>>, // task_id -> submissions
 }
 
 fn unix_now() -> u64 {
@@ -111,8 +107,6 @@ fn read_policy_id(policy_path: &PathBuf) -> anyhow::Result<String> {
     Ok(sha256_hex(&bytes))
 }
 
-/// consent token JSON must contain consent_payload.device_id matching expected,
-/// and device_sig_b64 must verify over sha256(JCS(consent_payload)).
 fn verify_consent(consent_token_json: &str, device_pubkey_b64: &str, device_id_expected: &str) -> anyhow::Result<()> {
     let token_v: Value = serde_json::from_str(consent_token_json)?;
     let payload = token_v.get("consent_payload").ok_or_else(|| anyhow::anyhow!("missing consent_payload"))?;
@@ -135,100 +129,11 @@ fn load_tasks_from_jsonl(path: &str) -> anyhow::Result<Vec<TaskSpec>> {
         let t = line.trim();
         if t.is_empty() { continue; }
         let spec: TaskSpec = serde_json::from_str(t)?;
-        if spec.protocol != "gmf/task/v1" {
-            continue;
+        if spec.protocol == "gmf/task/v1" {
+            out.push(spec);
         }
-        out.push(spec);
     }
     Ok(out)
-}
-
-// ---------- verifiers ----------
-
-fn fib_fast_doubling(n: u64) -> BigUint {
-    fn fd(n: u64) -> (BigUint, BigUint) {
-        if n == 0 {
-            return (BigUint::zero(), BigUint::one());
-        }
-        let (a, b) = fd(n >> 1); // (F(k), F(k+1))
-        // c = F(2k) = F(k) * (2*F(k+1) - F(k))
-        let two_b = &b << 1;
-        let two_b_minus_a = if two_b >= a { two_b - &a } else { BigUint::zero() };
-        let c = &a * &two_b_minus_a;
-        // d = F(2k+1) = F(k)^2 + F(k+1)^2
-        let d = &a * &a + &b * &b;
-        if (n & 1) == 0 {
-            (c, d)
-        } else {
-            (d.clone(), c + d)
-        }
-    }
-    fd(n).0
-}
-
-fn mod_pow(mut a: u128, mut d: u128, n: u128) -> u128 {
-    let mut r: u128 = 1;
-    a %= n;
-    while d > 0 {
-        if d & 1 == 1 { r = mul_mod(r, a, n); }
-        a = mul_mod(a, a, n);
-        d >>= 1;
-    }
-    r
-}
-
-fn mul_mod(a: u128, b: u128, m: u128) -> u128 {
-    // safe in u128 for mod mult of u64 operands
-    (a * b) % m
-}
-
-// Deterministic Miller-Rabin for 64-bit using well-known bases.
-fn is_prime_u64(n: u64) -> bool {
-    if n < 2 { return false; }
-    const SMALL: [u64; 12] = [2,3,5,7,11,13,17,19,23,29,31,37];
-    for &p in SMALL.iter() {
-        if n == p { return true; }
-        if n % p == 0 { return false; }
-    }
-    let mut d = (n - 1) as u128;
-    let mut s = 0u32;
-    while (d & 1) == 0 {
-        d >>= 1;
-        s += 1;
-    }
-    let n128 = n as u128;
-    // 64-bit deterministic bases
-    let bases: [u64; 7] = [2, 325, 9375, 28178, 450775, 9780504, 1795265022];
-    'outer: for &a0 in bases.iter() {
-        let a = (a0 as u128) % n128;
-        if a == 0 { continue; }
-        let mut x = mod_pow(a, d, n128);
-        if x == 1 || x == n128 - 1 { continue; }
-        for _ in 1..s {
-            x = mul_mod(x, x, n128);
-            if x == n128 - 1 { continue 'outer; }
-        }
-        return false;
-    }
-    true
-}
-
-fn verify_task_result(task: &TaskSpec, result: &Value) -> anyhow::Result<()> {
-    match task.kind.as_str() {
-        "fibonacci" => {
-            let n = task.params.get("n").and_then(|v| v.as_u64()).ok_or_else(|| anyhow::anyhow!("missing n"))?;
-            let expected = fib_fast_doubling(n).to_str_radix(10);
-            let got = result.as_str().ok_or_else(|| anyhow::anyhow!("result must be decimal string"))?;
-            if got == expected { Ok(()) } else { Err(anyhow::anyhow!("bad fib result")) }
-        }
-        "is_prime_64" => {
-            let x = task.params.get("x").and_then(|v| v.as_u64()).ok_or_else(|| anyhow::anyhow!("missing x"))?;
-            let expected = is_prime_u64(x);
-            let got = result.as_bool().ok_or_else(|| anyhow::anyhow!("result must be bool"))?;
-            if got == expected { Ok(()) } else { Err(anyhow::anyhow!("bad primality result")) }
-        }
-        _ => Err(anyhow::anyhow!("unknown kind")),
-    }
 }
 
 fn sign_ssr(server_sk_b64: &str, receipt_payload: &Value) -> anyhow::Result<(String,String)> {
@@ -244,53 +149,50 @@ fn sign_ssr(server_sk_b64: &str, receipt_payload: &Value) -> anyhow::Result<(Str
     Ok((server_pubkey_b64, server_sig_b64))
 }
 
-// ---------- HTTP handlers ----------
-
 async fn pull_task(state: axum::extract::State<AppState>, Json(req): Json<PullRequest>)
 -> Result<Json<PullResponse>, (axum::http::StatusCode, String)> {
     if req.protocol != "gmf/task_pull/v1" {
         return Err((axum::http::StatusCode::BAD_REQUEST, "bad protocol".into()));
     }
 
-    // verify pull signature
     verify_device_sig_over_payload(&req.device_pubkey_b64, &req.pull_payload, &req.device_sig_b64)
         .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e.to_string()))?;
 
     let device_id = device_id_from_pubkey_b64(&req.device_pubkey_b64)
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // consent required
     verify_consent(&req.consent_token_json, &req.device_pubkey_b64, &device_id)
         .map_err(|e| (axum::http::StatusCode::FORBIDDEN, e.to_string()))?;
 
     let now = unix_now();
-    let lease_secs: u64 = env::var("GMF_TASK_LEASE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let lease_secs: u64 = env::var("GMF_TASK_LEASE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(1200);
 
-    // pick first unassigned+uncompleted task
-    let mut tasks = state.tasks.lock().unwrap();
+    let tasks = state.tasks.lock().unwrap();
     let mut assigned = state.assigned.lock().unwrap();
     let completed = state.completed.lock().unwrap();
 
     // cleanup expired leases
     assigned.retain(|_, lease| lease.expires_at_unix > now);
 
-    let mut chosen: Option<TaskSpec> = None;
+    // pick first not-completed; allow multiple leases (for replicas) but not same device twice
     for t in tasks.iter() {
         if completed.contains(&t.task_id) { continue; }
-        if assigned.contains_key(&t.task_id) { continue; }
-        chosen = Some(t.clone());
-        break;
-    }
 
-    if let Some(task) = chosen.clone() {
-        assigned.insert(task.task_id.clone(), Lease{
-            device_id,
-            leased_at_unix: now,
+        // count active leases for this task
+        let active_leases = assigned.iter().filter(|(tid, _)| *tid == &t.task_id).count() as i64;
+        if active_leases >= t.replicas { continue; }
+
+        // prevent same device leasing same task
+        if assigned.get(&format!("{}::{}", t.task_id, device_id)).is_some() { continue; }
+
+        assigned.insert(format!("{}::{}", t.task_id, device_id), Lease{
+            device_id: device_id.clone(),
             expires_at_unix: now + lease_secs,
         });
+
         return Ok(Json(PullResponse{
             protocol: "gmf/task_pull_resp/v1".into(),
-            task: Some(task),
+            task: Some(t.clone()),
             message: "ok".into(),
         }));
     }
@@ -308,52 +210,84 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
         return Err((axum::http::StatusCode::BAD_REQUEST, "bad protocol".into()));
     }
 
-    // verify submit signature
     verify_device_sig_over_payload(&req.device_pubkey_b64, &req.submit_payload, &req.device_sig_b64)
         .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e.to_string()))?;
 
     let device_id = device_id_from_pubkey_b64(&req.device_pubkey_b64)
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // consent required
     verify_consent(&req.consent_token_json, &req.device_pubkey_b64, &device_id)
         .map_err(|e| (axum::http::StatusCode::FORBIDDEN, e.to_string()))?;
 
-    let task_id = req.submit_payload.get("task_id").and_then(|v| v.as_str()).ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "missing task_id".into()))?.to_string();
-    let result = req.submit_payload.get("result").ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "missing result".into()))?.clone();
+    let task_id = req.submit_payload.get("task_id").and_then(|v| v.as_str())
+        .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "missing task_id".into()))?
+        .to_string();
 
-    let now = unix_now();
+    let result_core = req.submit_payload.get("result_core")
+        .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "missing result_core".into()))?
+        .clone();
 
+    // verify device had a lease
     let mut assigned = state.assigned.lock().unwrap();
-    let mut completed = state.completed.lock().unwrap();
-
-    // lease check
-    let lease = assigned.get(&task_id).cloned().ok_or_else(|| (axum::http::StatusCode::CONFLICT, "task not leased".into()))?;
-    if lease.device_id != device_id {
-        return Err((axum::http::StatusCode::FORBIDDEN, "task leased to different device".into()));
-    }
-    if lease.expires_at_unix <= now {
-        assigned.remove(&task_id);
-        return Err((axum::http::StatusCode::CONFLICT, "lease expired".into()));
-    }
-    if completed.contains(&task_id) {
-        return Err((axum::http::StatusCode::CONFLICT, "task already completed".into()));
+    let lease_key = format!("{}::{}", task_id, device_id);
+    if assigned.remove(&lease_key).is_none() {
+        return Err((axum::http::StatusCode::CONFLICT, "no active lease for this device".into()));
     }
 
-    // find task spec
+    // locate task
     let tasks = state.tasks.lock().unwrap();
-    let task = tasks.iter().find(|t| t.task_id == task_id).cloned()
+    let task = tasks.iter().find(|t| t.task_id == task_id)
+        .cloned()
         .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "unknown task_id".into()))?;
 
-    // verify result (fast)
-    verify_task_result(&task, &result)
-        .map_err(|e| (axum::http::StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    // append submission
+    let mut subs_map = state.submissions.lock().unwrap();
+    let subs = subs_map.entry(task.task_id.clone()).or_insert_with(Vec::new);
 
-    // issue SSR
+    // prevent duplicate submission by same device
+    if subs.iter().any(|s| s.device_id == device_id) {
+        return Err((axum::http::StatusCode::CONFLICT, "duplicate submission".into()));
+    }
+
+    subs.push(Submission{
+        device_id: device_id.clone(),
+        result_core: result_core.clone(),
+        received_at: Utc::now().to_rfc3339(),
+    });
+
+    // check agreement
+    let needed = task.replicas.max(1) as usize;
+    if subs.len() < needed {
+        // not enough yet → return a 202-like SSR with 0? (simpler: still return SSR? no)
+        return Err((axum::http::StatusCode::ACCEPTED, format!("received {}/{} submissions; waiting", subs.len(), needed)));
+    }
+
+    // group by exact result_core (canonical-json hash)
+    let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+    for s in subs.iter() {
+        let canon = jcs_canonicalize(&s.result_core);
+        let h = hex::encode(sha256(&canon));
+        buckets.entry(h).or_default().push(s.device_id.clone());
+    }
+
+    // find winning bucket with >= needed
+    let (winner_hash, winners) = buckets.into_iter()
+        .find(|(_, devs)| devs.len() >= needed)
+        .ok_or_else(|| (axum::http::StatusCode::CONFLICT, "no agreement among replicas".into()))?;
+
+    // mark completed
+    let mut completed = state.completed.lock().unwrap();
+    completed.insert(task.task_id.clone());
+
+    // credits split
+    let per_device = (task.credit_micro_total / (task.replicas.max(1))) as i64;
+
+    // issue SSR FOR THIS submitting device only (others will get theirs when they submit; MVP)
     let policy_path = PathBuf::from(env::var("GMF_POLICY_PATH").unwrap_or_else(|_| "protocol/credits/v1/CREDITS_POLICY.md".into()));
     let policy_id = read_policy_id(&policy_path).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let server_sk_b64 = env::var("GMF_SERVER_SK_B64").map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing GMF_SERVER_SK_B64".into()))?;
+    let server_sk_b64 = env::var("GMF_SERVER_SK_B64")
+        .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing GMF_SERVER_SK_B64".into()))?;
 
     let receipt_payload = serde_json::json!({
         "protocol": "gmf/ssr_payload/v1",
@@ -362,9 +296,10 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
         "task_id": task.task_id,
         "task_kind": task.kind,
         "task_params": task.params,
-        "result": result,
-        "credits_delta_micro": task.credit_micro,
-        "reason_code": "verified_task",
+        "result_agreement_hash": winner_hash,
+        "replica_winners": winners,
+        "credits_delta_micro": per_device,
+        "reason_code": "replica_agreement",
         "issued_at": Utc::now().to_rfc3339()
     });
 
@@ -388,10 +323,6 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     writeln!(f, "{}", serde_json::to_string(&ssr).unwrap())
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // mark completed + release lease
-    completed.insert(task_id.clone());
-    assigned.remove(&task_id);
-
     Ok(Json(ssr))
 }
 
@@ -399,7 +330,6 @@ async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // preload tasks
     let tasks_path = env::var("GMF_TASKS_JSONL").unwrap_or_else(|_| "tasks/pool/tasks.jsonl".into());
     let tasks = load_tasks_from_jsonl(&tasks_path).unwrap_or_else(|_| vec![]);
     eprintln!("Loaded {} tasks from {}", tasks.len(), tasks_path);
@@ -408,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
         tasks: Arc::new(Mutex::new(tasks)),
         assigned: Arc::new(Mutex::new(HashMap::new())),
         completed: Arc::new(Mutex::new(HashSet::new())),
+        submissions: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -419,8 +350,7 @@ async fn main() -> anyhow::Result<()> {
     let host = env::var("GMF_RELAY_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = env::var("GMF_RELAY_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8787);
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
-    eprintln!("gmf_relay(taskd) listening on http://{addr}");
-
+    eprintln!("gmf_relay listening on http://{addr}");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
 }
