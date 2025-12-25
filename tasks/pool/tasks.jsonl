@@ -1,0 +1,4 @@
+{"protocol":"gmf/task/v1","task_id":"fib-0001","kind":"fibonacci","params":{"n":500000},"credit_micro":5000}
+{"protocol":"gmf/task/v1","task_id":"fib-0002","kind":"fibonacci","params":{"n":750000},"credit_micro":8000}
+{"protocol":"gmf/task/v1","task_id":"prime-0001","kind":"is_prime_64","params":{"x":18446744073709551557},"credit_micro":200}
+{"protocol":"gmf/task/v1","task_id":"prime-0002","kind":"is_prime_64","params":{"x":18446744073709551533},"credit_micro":200}
