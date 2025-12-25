@@ -137,7 +137,23 @@ def main():
                 if "@sha256:" not in params["docker_image"]:
                     raise SystemExit(f"lean_check {tid} docker_image must be digest pinned (@sha256:...)")
 
-                unit_id = compute_work_unit_id(kind, params)
+                
+                # pricing (credits policy v2): if file_count present, compute credit_micro_total
+                try:
+                    fc = int(env.get("file_count", params.get("file_count", 0)) or 0)
+                except Exception:
+                    fc = 0
+                def _to_int(x, default=0):
+                    try:
+                        return int(x)
+                    except Exception:
+                        return default
+                if fc > 0:
+                    base = _to_int(params.get("credit_base_micro", 500000), 500000)
+                    per  = _to_int(params.get("credit_per_file_micro", 150000), 150000)
+                    obj["credit_micro_total"] = base + per * fc
+                    params["file_count"] = fc
+unit_id = compute_work_unit_id(kind, params)
                 params["work_unit_id"] = unit_id
                 obj["params"] = params
 
