@@ -577,3 +577,80 @@ pub async fn run_audit_final_verify(relay_base: &str, params: &Value) -> Result<
         "relay_base_url": relay_base
     }))
 }
+
+
+async fn fetch_report_json(relay_base: &str, kind: &str, period_id: &str) -> Result<serde_json::Value> {
+    let base = relay_base.trim_end_matches('/');
+    let url = match kind {
+        "monthly" => format!("{}/v1/reports/monthly/final/{}", base, period_id),
+        "yearly" => format!("{}/v1/reports/yearly/final/{}", base, period_id),
+        _ => return Err(anyhow!("bad report kind")),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PAGE_TIMEOUT_SECS))
+        .build()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("report fetch failed: {}", resp.status()));
+    }
+    let txt = resp.text().await?;
+    Ok(serde_json::from_str(&txt)?)
+}
+
+fn verify_report_sig(env: &Value, payload_key: &str) -> Result<bool> {
+    let payload = env.get(payload_key).ok_or_else(|| anyhow!("missing payload"))?;
+    let pk_b64 = env.get("server_pubkey_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_pubkey_b64"))?;
+    let sig_b64 = env.get("server_sig_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_sig_b64"))?;
+
+    let pk_bytes = B64.decode(pk_b64)?;
+    let pk = VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| anyhow!("bad pk bytes"))?)
+        .map_err(|_| anyhow!("bad pk"))?;
+    let sig_bytes = B64.decode(sig_b64)?;
+    let sig = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| anyhow!("bad sig bytes"))?);
+
+    let canon = canonical_json_bytes_local(payload);
+    let msg = Sha256::digest(&canon);
+    Ok(pk.verify(&msg, &sig).is_ok())
+}
+
+fn recompute_report_rollup(payload: &Value) -> Option<String> {
+    let included = payload.get("included_dates")?;
+    let bindings = payload.get("bindings")?;
+    let roll_src = serde_json::json!({"included_dates": included, "bindings": bindings});
+    let canon = canonical_json_bytes_local(&roll_src);
+    let msg = Sha256::digest(&canon);
+    Some(hex::encode(msg))
+}
+
+pub async fn run_report_verify(relay_base: &str, params: &Value) -> Result<Value> {
+    let kind = params.get("report_kind").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing report_kind"))?;
+    let period_id = params.get("period_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing period_id"))?;
+
+    let env = fetch_report_json(relay_base, kind, period_id).await?;
+    let payload_key = match kind {
+        "monthly" => "monthly_final_payload",
+        "yearly" => "yearly_final_payload",
+        _ => return Err(anyhow!("bad report_kind")),
+    };
+    let sig_ok = verify_report_sig(&env, payload_key)?;
+
+    let payload = env.get(payload_key).ok_or_else(|| anyhow!("missing payload"))?;
+    let got = payload.get("merkle_or_rollup").and_then(|m| m.get("rollup_sha256")).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let recomputed = recompute_report_rollup(payload);
+    let rollup_ok = match (got.as_ref(), recomputed.as_ref()) {
+        (Some(a), Some(b)) => a == b,
+        _ => false
+    };
+
+    Ok(serde_json::json!({
+        "ok": sig_ok && rollup_ok,
+        "exit_code": if sig_ok && rollup_ok { 0 } else { 2 },
+        "report_kind": kind,
+        "period_id": period_id,
+        "report_sig_ok": sig_ok,
+        "rollup_sha256": got,
+        "recomputed_rollup_sha256": recomputed,
+        "rollup_matches": rollup_ok,
+        "relay_base_url": relay_base
+    }))
+}
