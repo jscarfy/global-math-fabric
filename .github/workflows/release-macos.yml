@@ -27,6 +27,16 @@ jobs:
           p12-file-base64: ${{ secrets.MACOS_DEVID_P12_B64 }}
           p12-password: ${{ secrets.MACOS_DEVID_P12_PASSWORD }}
 
+
+      - name: Set Info.plist versions from tag + validate Sparkle keys
+        shell: bash
+        run: |
+          cd clients/gmf_mobile_flutter
+          # set CFBundleShortVersionString/CFBundleVersion
+          ../../scripts/release/set_macos_plist_version_from_tag.sh "${GITHUB_REF_NAME}" macos/Runner/Info.plist
+          # hard CI check: SUFeedURL endswith /releases/appcast.xml AND SUPublicEDKey exists
+          ../../scripts/release/check_sparkle_plist.sh macos/Runner/Info.plist
+
       - name: Build macOS app (Flutter)
         shell: bash
         run: |
