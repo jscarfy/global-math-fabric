@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "defaults": {
+    "protocol": "gmf/task/v1",
+    "replicas": 2,
+    "credit_micro_total": 2000000
+  },
+  "tasks": [
+    {
+      "task_id": "leancheck_mathlib_demo_001",
+      "kind": "lean_check",
+      "credit_micro_total": 3000000,
+      "replicas": 2,
+      "params": {
+        "git_url": "https://github.com/leanprover-community/mathlib4.git",
+        "rev": "master",
+        "subdir": "",
+        "cmd": ["lake", "build"],
+        "use_mathlib_cache": true,
+
+        "artifacts_root": ".lake/build/lib",
+        "require_artifact_hash": true,
+
+        "require_source_hash": true,
+
+        "docker_image": "leanprovercommunity/lean@sha256:REPLACE_ME",
+        "require_digest": true
+      }
+    }
+  ]
+}
