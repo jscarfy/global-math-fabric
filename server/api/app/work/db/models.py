@@ -8,6 +8,9 @@ class Job(BaseWork):
     kind = Column(String, nullable=False)              # e.g. "proof_search", "lemma_check", "toy_math"
     payload_json = Column(Text, nullable=False)        # canonical json string
     credits = Column(Integer, nullable=False, default=1)
+    goal_key = Column(String, nullable=True, index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    accepted_once = Column(Boolean, nullable=False, default=False)
     status = Column(String, nullable=False, default="open")  # open|leased|done|cancelled
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

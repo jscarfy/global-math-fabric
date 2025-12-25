@@ -24,6 +24,19 @@ def _sha256_hex(s: str) -> str:
 def _canon(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
+
+def _goal_key(kind: str, payload: dict) -> str | None:
+    if kind == "lean_check":
+        imports = payload.get("imports") or []
+        stmt = str(payload.get("statement") or "")
+        obj = {"imports": imports, "statement": stmt}
+        return _sha256_hex(_canon(obj))
+    if kind == "audit_lean_check":
+        # audit payload already contains goal_key
+        gk = payload.get("goal_key")
+        return str(gk) if gk else None
+    return None
+
 def _validator_for(kind: str):
     if kind == "toy_math":
         return validate_toy_math
@@ -37,6 +50,10 @@ def create_job(kind: str, payload: dict, credits: int = 1):
     try:
         jid = str(uuid.uuid4())
         j = Job(job_id=jid, kind=kind, payload_json=_canon(payload), credits=int(credits), status="open")
+        try:
+            j.goal_key = _goal_key(kind, payload)
+        except Exception:
+            j.goal_key = None
         db.add(j); db.commit()
         return {"ok": True, "job_id": jid}
     finally:
@@ -106,7 +123,21 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict):
         else:
             ok, reason = vfn(payload, output)
 
+        # novelty policy (hard rule): first accepted for a goal_key gets full credits; repeats get repeat_factor
+        repeat_factor = float(os.environ.get("GMF_REPEAT_FACTOR", "0.1"))
+        audit_credits = int(os.environ.get("GMF_AUDIT_CREDITS", "1"))
         awarded = int(job.credits) if ok else 0
+        if ok and job.goal_key:
+            # if already accepted once for this goal_key, downweight
+            prev = db.query(Job).filter(Job.goal_key == job.goal_key, Job.accepted_once == True).first()
+            if prev and prev.job_id != job.job_id:
+                awarded = max(0, int(round(int(job.credits) * repeat_factor)))
+
+        # attempts
+        try:
+            job.attempts = int(job.attempts or 0) + 1
+        except Exception:
+            job.attempts = 1
 
         # record result
         rid = str(uuid.uuid4())
@@ -129,6 +160,7 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict):
         # mark job done if accepted (MVP：接受即 done；否则 reopen 让别人再试)
         if ok:
             job.status = "done"
+            job.accepted_once = True
         else:
             job.status = "open"
 
@@ -151,6 +183,20 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict):
                 "issued_at": _now().replace(tzinfo=datetime.timezone.utc).isoformat()
             }
             env = append_envelope_line(payload_obj)
+            # create audit job for independent re-check (pays auditors)
+            if job.kind == "lean_check" and job.goal_key:
+                audit_payload = {
+                    "goal_key": job.goal_key,
+                    "imports": payload.get("imports") if isinstance(payload, dict) else [],
+                    "theorem_name": "audit_" + str(payload.get("theorem_name") or "t"),
+                    "statement": str(payload.get("statement") or ""),
+                    "original_receipt_id": payload_obj["receipt_id"],
+                    "proof_script": output.get("proof_script")
+                }
+                aj = Job(job_id=str(uuid.uuid4()), kind="audit_lean_check", payload_json=_canon(audit_payload), credits=int(audit_credits), status="open")
+                aj.goal_key = job.goal_key
+                db.add(aj)
+                db.commit()
             wr.receipt_id = payload_obj["receipt_id"]
             db.add(wr); db.commit()
             return {"ok": True, "accepted": True, "reason": reason, "awarded_credits": awarded, "receipt": env}
