@@ -1551,6 +1551,204 @@ fn read_canonical_totals(date: &str) -> (Option<i64>, Option<i64>) {
     (main, audit)
 }
 
+
+fn report_audit_log_path(kind: &str, period_id: &str) -> Result<PathBuf, String> {
+    match kind {
+        "monthly" => Ok(PathBuf::from("ledger/report_audit/monthly").join(format!("{period_id}.report_audit.jsonl"))),
+        "yearly"  => Ok(PathBuf::from("ledger/report_audit/yearly").join(format!("{period_id}.report_audit.jsonl"))),
+        _ => Err("bad report_kind".into())
+    }
+}
+fn report_audit_final_path(kind: &str, period_id: &str) -> Result<PathBuf, String> {
+    match kind {
+        "monthly" => Ok(PathBuf::from("ledger/report_audit/monthly").join(format!("{period_id}.report_audit_final.json"))),
+        "yearly"  => Ok(PathBuf::from("ledger/report_audit/yearly").join(format!("{period_id}.report_audit_final.json"))),
+        _ => Err("bad report_kind".into())
+    }
+}
+fn append_report_audit_line(kind: &str, period_id: &str, line: &serde_json::Value) -> Result<(), String> {
+    let path = report_audit_log_path(kind, period_id)?;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
+    use std::io::Write;
+    let mut bytes = serde_json::to_vec(line).unwrap();
+    bytes.push(b'\n');
+    f.write_all(&bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportAuditReceiptReq {
+    consent_token_json: serde_json::Value,
+    device_pubkey_b64: String,
+    report_audit_payload: serde_json::Value
+}
+
+fn compute_report_audit_summary(kind: &str, period_id: &str) -> Result<serde_json::Value, String> {
+    let p = report_audit_log_path(kind, period_id)?;
+    if !p.exists() { return Err("no report_audit log".into()); }
+    let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
+    let log_sha256 = sha256_hex_bytes(&bytes);
+
+    let mut total = 0i64;
+    let mut parse_err = 0i64;
+    let mut ok = 0i64;
+    let mut bad = 0i64;
+    let mut uniq_devices = std::collections::HashSet::<String>::new();
+
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.is_empty() { continue; }
+        total += 1;
+        let v: serde_json::Value = match serde_json::from_slice(line) {
+            Ok(x) => x, Err(_) => { parse_err += 1; continue; }
+        };
+        let payload = match v.get("report_audit_payload") { Some(p) => p, None => { parse_err += 1; continue; } };
+        if let Some(d) = payload.get("device_id").and_then(|x| x.as_str()) { uniq_devices.insert(d.to_string()); }
+        if payload.get("verifier_result_ok").and_then(|x| x.as_bool()).unwrap_or(false) { ok += 1; } else { bad += 1; }
+    }
+
+    Ok(serde_json::json!({
+        "report_kind": kind,
+        "period_id": period_id,
+        "generated_at_unix_ms": now_unix_ms(),
+        "report_audit_log_sha256": log_sha256,
+        "receipts_total": total,
+        "receipts_parse_errors": parse_err,
+        "verifier_ok": ok,
+        "verifier_bad": bad,
+        "unique_devices": uniq_devices.len()
+    }))
+}
+
+fn write_report_audit_final_once(kind: &str, period_id: &str) -> Result<serde_json::Value, String> {
+    let outp = report_audit_final_path(kind, period_id)?;
+    if outp.exists() {
+        let txt = std::fs::read_to_string(&outp).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+        return Ok(v);
+    }
+    let payload = compute_report_audit_summary(kind, period_id)?;
+    let canon = canonical_json_bytes(&payload);
+    let msg = sha2::Sha256::digest(&canon);
+    let sig_b64 = server_sign_fn.as_ref()(&msg);
+    let env = serde_json::json!({
+        "report_audit_final_payload": payload,
+        "server_pubkey_b64": server_pubkey_b64_str,
+        "server_sig_b64": sig_b64
+    });
+    if let Some(parent) = outp.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let tmp = outp.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&env).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &outp).map_err(|e| e.to_string())?;
+    Ok(env)
+}
+
+async fn report_audit_receipt(
+    axum::extract::State(_state): axum::extract::State<AppState>,
+    axum::Json(req): axum::Json<ReportAuditReceiptReq>,
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    let device_id = req.consent_token_json.get("device_id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    verify_consent(&req.consent_token_json, &req.device_pubkey_b64, &device_id)
+        .map_err(|e| (axum::http::StatusCode::FORBIDDEN, e.to_string()))?;
+
+    let mut payload = req.report_audit_payload.clone();
+    let kind = payload.get("report_kind").and_then(|v| v.as_str()).ok_or((axum::http::StatusCode::BAD_REQUEST, "missing report_kind".into()))?.to_string();
+    let pid  = payload.get("period_id").and_then(|v| v.as_str()).ok_or((axum::http::StatusCode::BAD_REQUEST, "missing period_id".into()))?.to_string();
+    let target = payload.get("target_rollup_sha256").and_then(|v| v.as_str()).ok_or((axum::http::StatusCode::BAD_REQUEST, "missing target_rollup_sha256".into()))?.to_string();
+
+    // Preconditions: report anchor must exist and match target rollup
+    if kind == "monthly" {
+        let rp = monthly_report_path(&pid);
+        if !rp.exists() { return Err((axum::http::StatusCode::PRECONDITION_FAILED, "no monthly_final".into())); }
+        let txt = std::fs::read_to_string(&rp).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let env: serde_json::Value = serde_json::from_str(&txt).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let sha = env.get("monthly_final_payload").and_then(|p| p.get("merkle_or_rollup")).and_then(|m| m.get("rollup_sha256")).and_then(|v| v.as_str()).unwrap_or("");
+        if sha != target { return Err((axum::http::StatusCode::BAD_REQUEST, "monthly rollup mismatch".into())); }
+    } else if kind == "yearly" {
+        let rp = yearly_report_path(&pid);
+        if !rp.exists() { return Err((axum::http::StatusCode::PRECONDITION_FAILED, "no yearly_final".into())); }
+        let txt = std::fs::read_to_string(&rp).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let env: serde_json::Value = serde_json::from_str(&txt).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let sha = env.get("yearly_final_payload").and_then(|p| p.get("merkle_or_rollup")).and_then(|m| m.get("rollup_sha256")).and_then(|v| v.as_str()).unwrap_or("");
+        if sha != target { return Err((axum::http::StatusCode::BAD_REQUEST, "yearly rollup mismatch".into())); }
+    } else {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "bad report_kind".into()));
+    }
+
+    // Must be positive
+    let ok = payload.get("verifier_result_ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !ok { return Err((axum::http::StatusCode::BAD_REQUEST, "verifier_result_ok must be true".into())); }
+
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("device_id".into(), serde_json::Value::String(device_id));
+        obj.insert("device_pubkey_b64".into(), serde_json::Value::String(req.device_pubkey_b64));
+        obj.insert("server_time_unix_ms".into(), serde_json::Value::Number(now_unix_ms().into()));
+    }
+
+    let canon = canonical_json_bytes(&payload);
+    let msg = sha2::Sha256::digest(&canon);
+    let sig_b64 = server_sign_fn.as_ref()(&msg);
+    let env = serde_json::json!({
+        "report_audit_payload": payload,
+        "server_pubkey_b64": server_pubkey_b64_str,
+        "server_sig_b64": sig_b64
+    });
+
+    append_report_audit_line(&kind, &pid, &env).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
+}
+
+async fn report_audit_log_monthly(axum::extract::Path(pid): axum::extract::Path<String>)
+-> Result<(axum::http::StatusCode,String),(axum::http::StatusCode,String)> {
+    let p = report_audit_log_path("monthly",&pid).map_err(|e|(axum::http::StatusCode::BAD_REQUEST,e))?;
+    if !p.exists() { return Err((axum::http::StatusCode::NOT_FOUND, "no report_audit log".into())); }
+    let txt = std::fs::read_to_string(&p).map_err(|e|(axum::http::StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    Ok((axum::http::StatusCode::OK, txt))
+}
+async fn report_audit_log_yearly(axum::extract::Path(pid): axum::extract::Path<String>)
+-> Result<(axum::http::StatusCode,String),(axum::http::StatusCode,String)> {
+    let p = report_audit_log_path("yearly",&pid).map_err(|e|(axum::http::StatusCode::BAD_REQUEST,e))?;
+    if !p.exists() { return Err((axum::http::StatusCode::NOT_FOUND, "no report_audit log".into())); }
+    let txt = std::fs::read_to_string(&p).map_err(|e|(axum::http::StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    Ok((axum::http::StatusCode::OK, txt))
+}
+
+async fn report_audit_final_monthly(axum::extract::Path(pid): axum::extract::Path<String>)
+-> Result<(axum::http::StatusCode,String),(axum::http::StatusCode,String)> {
+    let p = report_audit_final_path("monthly",&pid).map_err(|e|(axum::http::StatusCode::BAD_REQUEST,e))?;
+    if !p.exists() { return Err((axum::http::StatusCode::NOT_FOUND, "no report_audit_final".into())); }
+    let txt = std::fs::read_to_string(&p).map_err(|e|(axum::http::StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    Ok((axum::http::StatusCode::OK, txt))
+}
+async fn report_audit_final_yearly(axum::extract::Path(pid): axum::extract::Path<String>)
+-> Result<(axum::http::StatusCode,String),(axum::http::StatusCode,String)> {
+    let p = report_audit_final_path("yearly",&pid).map_err(|e|(axum::http::StatusCode::BAD_REQUEST,e))?;
+    if !p.exists() { return Err((axum::http::StatusCode::NOT_FOUND, "no report_audit_final".into())); }
+    let txt = std::fs::read_to_string(&p).map_err(|e|(axum::http::StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    Ok((axum::http::StatusCode::OK, txt))
+}
+
+async fn report_audit_finalize_monthly(
+    axum::extract::Path(pid): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String,String>>
+)-> Result<(axum::http::StatusCode,String),(axum::http::StatusCode,String)> {
+    let admin = std::env::var("GMF_ADMIN_TOKEN").unwrap_or_default();
+    let tok = q.get("token").cloned().unwrap_or_default();
+    if !admin.is_empty() && tok != admin { return Err((axum::http::StatusCode::FORBIDDEN,"forbidden".into())); }
+    let env = write_report_audit_final_once("monthly",&pid).map_err(|e|(axum::http::StatusCode::PRECONDITION_FAILED,e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
+}
+async fn report_audit_finalize_yearly(
+    axum::extract::Path(pid): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String,String>>
+)-> Result<(axum::http::StatusCode,String),(axum::http::StatusCode,String)> {
+    let admin = std::env::var("GMF_ADMIN_TOKEN").unwrap_or_default();
+    let tok = q.get("token").cloned().unwrap_or_default();
+    if !admin.is_empty() && tok != admin { return Err((axum::http::StatusCode::FORBIDDEN,"forbidden".into())); }
+    let env = write_report_audit_final_once("yearly",&pid).map_err(|e|(axum::http::StatusCode::PRECONDITION_FAILED,e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
