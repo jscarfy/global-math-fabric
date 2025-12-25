@@ -82,3 +82,23 @@ def merkle_db_path() -> str:
 
 def merkle_cache() -> MerkleCache:
     return MerkleCache(merkle_db_path())
+
+
+def ledger_entries_meta() -> int:
+    """
+    Fast ledger length using MerkleCache meta. Falls back to scanning file once.
+    """
+    ensure_ledger_file()
+    mc = merkle_cache()
+    v = mc.meta_get_int("ledger_entries")
+    if v is not None and v >= 0:
+        return v
+
+    # one-time fallback scan
+    n = 0
+    with open(ledger_path(), "r", encoding="utf-8") as f:
+        for ln in f:
+            if ln.strip():
+                n += 1
+    mc.meta_set_int("ledger_entries", n)
+    return n

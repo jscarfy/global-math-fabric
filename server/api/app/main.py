@@ -1020,3 +1020,35 @@ def ledger_receipt_proof_bundle(receipt_id: str):
         return {"ok": True, "bundle": bundle}
     finally:
         db.close()
+
+
+@app.get("/ledger/cache/status")
+def ledger_cache_status():
+    mc = MerkleCache(os.environ.get("GMF_MERKLE_DB", "ledger/cache/merkle_nodes.sqlite"))
+    n = 0
+    try:
+        n = ledger_mod.ledger_entries_meta()
+    except Exception:
+        n = 0
+    return {
+        "ledger_entries": int(n),
+        "cached_nodes": mc.count_nodes(),
+        "prewarm_n_leaves": mc.meta_get_int("prewarm_n_leaves"),
+        "prewarm_upto_level": mc.meta_get_int("prewarm_upto_level"),
+        "prewarm_complete": mc.meta_get_int("prewarm_complete"),
+    }
+
+@app.post("/ledger/cache/prewarm")
+def ledger_cache_prewarm(budget_nodes: int = 200000):
+    """
+    Prewarm internal Merkle nodes up to root level for current ledger length.
+    Run this periodically (or before issuing a checkpoint) to stabilize performance.
+    """
+    mc = MerkleCache(os.environ.get("GMF_MERKLE_DB", "ledger/cache/merkle_nodes.sqlite"))
+    n = ledger_mod.ledger_entries_meta()
+    if n <= 0:
+        return {"ok": True, "n_leaves": 0}
+    from app.crypto.merkle_cache import root_level
+    upto = root_level(n)
+    res = mc.prewarm(n, upto_level=upto, budget_nodes=int(budget_nodes))
+    return {"ok": True, "n_leaves": int(n), "upto_level": int(upto), "res": res, "cached_nodes": mc.count_nodes()}

@@ -158,3 +158,55 @@ class MerkleCache:
             cnt = nodes_count(n_anchor, level)
 
         return {"siblings": siblings, "directions": directions, "index0": idx, "leaves": n_anchor}
+
+
+    def meta_get_int(self, k: str) -> Optional[int]:
+        v = self.meta_get(k)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    def meta_set_int(self, k: str, v: int) -> None:
+        self.meta_set(k, str(int(v)))
+
+
+    def count_nodes(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
+        return int(row[0] or 0)
+
+    def prewarm(self, n_leaves: int, upto_level: Optional[int] = None, budget_nodes: int = 200000) -> dict:
+        """
+        Compute and cache missing internal nodes up to upto_level (default: root level for n_leaves).
+        Budget is number of (level,idx) computations attempted this call.
+        Stores watermark in meta when a full prewarm completes.
+        """
+        if n_leaves <= 0:
+            return {"ok": True, "n_leaves": 0, "computed": 0, "upto_level": 0}
+
+        if upto_level is None:
+            upto_level = root_level(n_leaves)
+
+        budget_nodes = max(1, int(budget_nodes))
+        computed = 0
+        attempted = 0
+
+        # prewarm internal levels only (level>=1)
+        for lvl in range(1, int(upto_level) + 1):
+            cnt = nodes_count(n_leaves, lvl)
+            for idx in range(0, cnt):
+                if attempted >= budget_nodes:
+                    return {"ok": True, "partial": True, "n_leaves": n_leaves, "upto_level": upto_level, "computed": computed, "attempted": attempted}
+                attempted += 1
+                if self.get(lvl, idx) is not None:
+                    continue
+                _ = self.node_hash(lvl, idx, n_leaves)
+                computed += 1
+
+        # completed up to upto_level
+        self.meta_set_int("prewarm_n_leaves", int(n_leaves))
+        self.meta_set_int("prewarm_upto_level", int(upto_level))
+        self.meta_set_int("prewarm_complete", 1)
+        return {"ok": True, "partial": False, "n_leaves": n_leaves, "upto_level": upto_level, "computed": computed, "attempted": attempted}

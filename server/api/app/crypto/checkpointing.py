@@ -5,6 +5,7 @@ from typing import Any, Dict, Tuple, List
 
 from app.crypto.governance import load_json, load_ed25519_pub_pem
 from app.crypto.ledger import ledger_path, read_all_lines
+from app.crypto import ledger as ledger_mod
 from app.crypto.merkle import _h, merkle_root_from_leaf_hashes
 
 def now_iso() -> str:
@@ -25,10 +26,34 @@ def leaf_hashes_from_ledger_lines(lines: List[bytes]) -> List[bytes]:
     return [_h(x) for x in lines]
 
 def current_ledger_root_and_len() -> Tuple[str, int]:
-    lines = read_all_lines()
-    n = len(lines)
+    # Fast path: use MerkleCache meta ledger_entries (maintained on append)
+    n = 0
+    try:
+        n = int(ledger_mod.ledger_entries_meta())
+    except Exception:
+        n = 0
+
     if n <= 0:
         return ("00"*32), 0
+
+    mc = _mc()
+    # Leaves should already exist because append stores them; but be defensive:
+    # if cache missing leaves (fresh DB), rebuild leaves once.
+    missing = False
+    for i in range(0, min(n, 32)):  # quick spot-check first 32
+        if mc.get(0, i) is None:
+            missing = True
+            break
+    if missing:
+        lines = read_all_lines()
+        for i, b in enumerate(lines):
+            if mc.get(0, i) is None:
+                mc.ensure_leaf_hash(i, b)
+        mc.meta_set_int("ledger_entries", len(lines))
+        n = len(lines)
+
+    return mc.root_for_n(n), n
+
     # ensure leaves exist (best-effort); internal nodes are lazy
     mc = _mc()
     for i, b in enumerate(lines):
