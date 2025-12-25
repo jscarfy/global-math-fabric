@@ -102,3 +102,10 @@ dev_dependencies:
 
 # Background tasks
 dependency_overrides:
+
+msix_config:
+  display_name: Global Math Fabric
+  publisher_display_name: GMF
+  identity_name: com.globalmathfabric.gmf
+  msix_version: 0.1.0.0
+  capabilities: internetClient
