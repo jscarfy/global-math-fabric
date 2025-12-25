@@ -113,6 +113,33 @@ fn extract_ts_unix_ms(ssr: &serde_json::Value) -> Option<i64> {
     None
 }
 
+
+fn canonical_json_bytes(v: &serde_json::Value) -> Vec<u8> {
+    fn sort(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<_> = map.keys().cloned().collect();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for k in keys {
+                    out.insert(k.clone(), sort(&map[&k]));
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(sort).collect()),
+            _ => v.clone()
+        }
+    }
+    serde_json::to_vec(&sort(v)).unwrap()
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -869,6 +896,61 @@ async fn ledger_ssr_delta(
     let may_have_more = if kept >= max_lines { "1" } else { "0" };
     headers.insert("X-GMF-MAY-HAVE-MORE", axum::http::HeaderValue::from_str(may_have_more).unwrap());
     Ok((axum::http::StatusCode::OK, headers, out))
+}
+
+
+fn final_snapshot_path(date: &str) -> PathBuf {
+    PathBuf::from("ledger/snapshots").join(format!("{date}.final.json"))
+}
+
+fn compute_final_snapshot_payload(date: &str) -> Result<serde_json::Value, String> {
+    let path = inbox_path(date);
+    if !path.exists() { return Err("no such ledger day".into()); }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let total_bytes = bytes.len() as i64;
+    let total_lines = bytes.iter().filter(|b| **b == b'\n').count() as i64
+        + if bytes.len() > 0 && *bytes.last().unwrap() != b'\n' { 1 } else { 0 };
+    let ssr_sha256 = sha256_hex_bytes(&bytes);
+    Ok(serde_json::json!({
+        "date": date,
+        "finalized_at_unix_ms": now_unix_ms(),
+        "ssr_sha256": ssr_sha256,
+        "total_bytes": total_bytes,
+        "total_lines": total_lines,
+        "policy": "credits_policy_v2_deterministic",
+        "inbox_file": format!("ledger/inbox/{date}.ssr.jsonl")
+    }))
+}
+
+// Signed envelope mirrors SSR pattern (payload + server_pubkey_b64 + server_sig_b64)
+fn write_final_snapshot_once(
+    date: &str,
+    server_pubkey_b64: &str,
+    server_sign_fn: &dyn Fn(&[u8]) -> String
+) -> Result<serde_json::Value, String> {
+    let out_path = final_snapshot_path(date);
+    if out_path.exists() {
+        let txt = std::fs::read_to_string(&out_path).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+        return Ok(v);
+    }
+
+    let payload = compute_final_snapshot_payload(date)?;
+    let canon = canonical_json_bytes(&payload);
+    let msg = sha2::Sha256::digest(&canon);
+    let sig_b64 = server_sign_fn(&msg);
+
+    let env = serde_json::json!({
+        "final_payload": payload,
+        "server_pubkey_b64": server_pubkey_b64,
+        "server_sig_b64": sig_b64
+    });
+
+    if let Some(parent) = out_path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let tmp = out_path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&env).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &out_path).map_err(|e| e.to_string())?;
+    Ok(env)
 }
 
 async fn health() -> &'static str { "ok" }
