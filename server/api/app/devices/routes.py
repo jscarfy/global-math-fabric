@@ -5,17 +5,18 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 
 from .store import append_device_event, load_devices_index, _now
+from app.auth.bearer import require_account
 
 router = APIRouter(prefix="/api/device", tags=["device"])
 
 class RegisterReq(BaseModel):
-    account_id: str
+    account_id: str = ""
     device_pubkey: str
     device_sig: str
     device_msg_version: str = "gmf:register:v1"
 
 class RevokeReq(BaseModel):
-    account_id: str
+    account_id: str = ""
     device_pubkey: str
 
 def _verify_register_sig(account_id: str, device_pubkey_hex: str, device_sig_hex: str) -> tuple[bool,str]:
@@ -33,7 +34,14 @@ def _verify_register_sig(account_id: str, device_pubkey_hex: str, device_sig_hex
         return (False, "bad_payload")
 
 @router.post("/register")
-def register(req: RegisterReq):
+def register(req: RegisterReq, authorization: str | None = None):
+    arec, err = require_account(authorization)
+    if err: return err
+    token_account_id = arec['account_id']
+    if req.account_id and req.account_id != token_account_id:
+        return JSONResponse(status_code=400, content={'ok': False, 'reason': 'account_mismatch'})
+    req.account_id = token_account_id
+
     ok, rs = _verify_register_sig(req.account_id, req.device_pubkey, req.device_sig)
     if not ok:
         return JSONResponse(status_code=400, content={"ok": False, "reason": rs})
@@ -50,7 +58,14 @@ def register(req: RegisterReq):
     return {"ok": True, "status": "registered"}
 
 @router.post("/revoke")
-def revoke(req: RevokeReq):
+def revoke(req: RevokeReq, authorization: str | None = None):
+    arec, err = require_account(authorization)
+    if err: return err
+    token_account_id = arec['account_id']
+    if req.account_id and req.account_id != token_account_id:
+        return JSONResponse(status_code=400, content={'ok': False, 'reason': 'account_mismatch'})
+    req.account_id = token_account_id
+
     idx = load_devices_index()
     pk = req.device_pubkey.strip().lower()
     rec = idx.get(pk)
@@ -64,7 +79,12 @@ def revoke(req: RevokeReq):
     return {"ok": True, "status": "revoked"}
 
 @router.get("/list/{account_id}")
-def list_devices(account_id: str):
+def list_devices(account_id: str, authorization: str | None = None):
+    arec, err = require_account(authorization)
+    if err: return err
+    if account_id != arec['account_id']:
+        return JSONResponse(status_code=400, content={'ok': False, 'reason': 'account_mismatch'})
+
     idx = load_devices_index()
     out = [v for v in idx.values() if v.get("account_id")==account_id]
     return {"ok": True, "devices": out}
