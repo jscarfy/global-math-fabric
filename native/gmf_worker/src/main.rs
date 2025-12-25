@@ -328,6 +328,11 @@ async fn main() -> anyhow::Result<()> {
                 let rc = crate::helper_tasks::run_ledger_audit(&relay_base_url, &task.params).await?;
                 rc
             }
+
+            "final_verify" => {
+                let rc = crate::helper_tasks::run_final_verify(&relay_base_url, &task.params).await?;
+                rc
+            }
 "lean_check" => {
                 eprintln!("solve lean_check {task_id} …");
                 solve_lean_check(&task).unwrap_or_else(|e| serde_json::json!({
