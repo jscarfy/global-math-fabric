@@ -1,0 +1,12 @@
+[project]
+name = "gmf-worker"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "sqlalchemy>=2.0.0",
+  "psycopg[binary]>=3.2.0",
+  "redis>=5.0.0",
+  "requests>=2.32.0",
+]
+
+[tool.uv]
