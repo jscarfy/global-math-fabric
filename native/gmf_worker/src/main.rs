@@ -344,7 +344,7 @@ async fn main() -> anyhow::Result<()> {
                         let attest_payload = serde_json::json!({
                             "date": date,
                             "final_sig_ok": final_sig_ok,
-                            "final_ssr_sha256": rc.get("snapshot_sha256").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            "final_ssr_sha256": rc.get("final_ssr_sha256").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             "verifier_kind": "gmf_worker_helper",
                             "verifier_version": env!("CARGO_PKG_VERSION")
                         });
