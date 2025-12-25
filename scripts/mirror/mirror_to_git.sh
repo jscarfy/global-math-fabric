@@ -20,7 +20,7 @@ if [ ! -d .git ]; then
   git init
 fi
 
-mkdir -p ledger/policies ledger/audit ledger/receipts/manifests ledger/verifications/manifests ledger/xlinks/manifests ledger/audit_bundles/manifests ledger/audit_transcripts/manifests ledger/daily_roots
+mkdir -p ledger/policies ledger/policies/manifests ledger/audit ledger/receipts/manifests ledger/verifications/manifests ledger/xlinks/manifests ledger/audit_bundles/manifests ledger/audit_transcripts/manifests ledger/daily_roots
 rsync -av --delete "$SRC_ROOT/ledger/policies/" ./ledger/policies/ 2>/dev/null || true
 rsync -av --delete "$SRC_ROOT/ledger/audit/" ./ledger/audit/
 rsync -av --delete "$SRC_ROOT/ledger/receipts/manifests/" ./ledger/receipts/manifests/ 2>/dev/null || true
