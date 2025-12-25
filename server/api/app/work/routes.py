@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from .db.work_db import SessionWork
-from .db.models import Job, JobLease, WorkResult
+from .db.models import Job, JobLease, WorkResult, Device, DeviceDaily
 
 from app.crypto.ledger import append_envelope_line
 from app.crypto.governance import load_governance_or_die
@@ -23,6 +23,36 @@ def _sha256_hex(s: str) -> str:
 
 def _canon(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _utc_day() -> str:
+    return _now().strftime("%Y-%m-%d")
+
+def _csv_norm(sv: str) -> str:
+    parts = [x.strip() for x in (sv or "").split(",")]
+    parts = [x for x in parts if x]
+    # stable order
+    parts = sorted(set(parts))
+    return ",".join(parts)
+
+def _device_get_or_create(db: Session, device_id: str) -> Device:
+    d = db.query(Device).filter(Device.device_id == device_id).first()
+    if not d:
+        d = Device(device_id=device_id, platform="unknown", has_lean=False, ram_mb=0, disk_mb=0, topics_csv="", meta_json="{}")
+        db.add(d); db.commit()
+    return d
+
+def _quota_daily_limit() -> int:
+    return int(os.environ.get("GMF_DEVICE_DAILY_CREDIT_LIMIT", "0"))  # 0 => unlimited
+
+def _device_daily_row(db: Session, device_id: str) -> DeviceDaily:
+    day = _utc_day()
+    rid = f"{device_id}|{day}"
+    row = db.query(DeviceDaily).filter(DeviceDaily.id == rid).first()
+    if not row:
+        row = DeviceDaily(id=rid, device_id=device_id, day=day, credits_awarded=0)
+        db.add(row); db.commit()
+    return row
 
 
 def _goal_key(kind: str, payload: dict) -> str | None:
@@ -45,11 +75,15 @@ def _validator_for(kind: str):
     return None
 
 @router.post("/jobs/create")
-def create_job(kind: str, payload: dict, credits: int = 1):
+def create_job(kind: str, payload: dict, credits: int = 1, topic: str = "", requires_lean: bool = False, min_ram_mb: int = 0, min_disk_mb: int = 0):
     db: Session = SessionWork()
     try:
         jid = str(uuid.uuid4())
         j = Job(job_id=jid, kind=kind, payload_json=_canon(payload), credits=int(credits), status="open")
+        j.topic = (topic.strip() or None)
+        j.requires_lean = bool(requires_lean)
+        j.min_ram_mb = int(min_ram_mb)
+        j.min_disk_mb = int(min_disk_mb)
         try:
             j.goal_key = _goal_key(kind, payload)
         except Exception:
@@ -60,14 +94,36 @@ def create_job(kind: str, payload: dict, credits: int = 1):
         db.close()
 
 @router.get("/jobs/pull")
-def pull_job(device_id: str):
+def pull_job(device_id: str, topics: str = ""):
     """
     Lease one open job. If none, returns ok=true + job=null.
     """
     db: Session = SessionWork()
     try:
-        # find open job
-        j = db.query(Job).filter(Job.status == "open").order_by(Job.created_at.asc()).first()
+        d = _device_get_or_create(db, device_id)
+        d.last_seen_at = _now()
+        db.add(d); db.commit()
+        # topics preference: query param overrides device setting if provided
+        topics_csv = _csv_norm(topics) if topics.strip() else (d.topics_csv or "")
+        allowed_topics = set([t for t in topics_csv.split(",") if t])
+        # find open job matching capabilities + topic
+        q = db.query(Job).filter(Job.status == "open")
+        # capability filters
+        q = q.filter((Job.requires_lean == False) | (Job.requires_lean == True))
+        # we'll enforce requires_lean manually because sqlite bool semantics can vary
+        candidates = q.order_by(Job.created_at.asc()).limit(200).all()
+        j = None
+        for cand in candidates:
+            if cand.requires_lean and not bool(d.has_lean):
+                continue
+            if int(cand.min_ram_mb or 0) > int(d.ram_mb or 0):
+                continue
+            if int(cand.min_disk_mb or 0) > int(d.disk_mb or 0):
+                continue
+            if cand.topic and allowed_topics and cand.topic not in allowed_topics:
+                continue
+            j = cand
+            break
         if not j:
             return {"ok": True, "job": None}
 
@@ -183,6 +239,11 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict):
                 "issued_at": _now().replace(tzinfo=datetime.timezone.utc).isoformat()
             }
             env = append_envelope_line(payload_obj)
+            lim = _quota_daily_limit()
+            if lim > 0:
+                row = _device_daily_row(db, device_id)
+                row.credits_awarded = int(row.credits_awarded or 0) + int(awarded)
+                db.add(row); db.commit()
             # create audit job for independent re-check (pays auditors)
             if job.kind == "lean_check" and job.goal_key:
                 audit_payload = {
@@ -202,5 +263,38 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict):
             return {"ok": True, "accepted": True, "reason": reason, "awarded_credits": awarded, "receipt": env}
 
         return {"ok": True, "accepted": False, "reason": reason, "awarded_credits": 0}
+    finally:
+        db.close()
+
+
+@router.post("/devices/register")
+def device_register(device_id: str, platform: str = "unknown", has_lean: bool = False, ram_mb: int = 0, disk_mb: int = 0, topics: str = "", meta: dict | None = None):
+    """
+    Device announces capabilities + preferred topics.
+    topics: csv, e.g. "algebra,nt,topology"
+    """
+    db: Session = SessionWork()
+    try:
+        d = _device_get_or_create(db, device_id)
+        d.platform = platform
+        d.has_lean = bool(has_lean)
+        d.ram_mb = int(ram_mb)
+        d.disk_mb = int(disk_mb)
+        d.topics_csv = _csv_norm(topics)
+        d.meta_json = _canon(meta or {})
+        d.last_seen_at = _now()
+        db.add(d); db.commit()
+        return {"ok": True, "device_id": device_id, "platform": d.platform, "has_lean": d.has_lean, "topics": d.topics_csv}
+    finally:
+        db.close()
+
+@router.post("/devices/heartbeat")
+def device_heartbeat(device_id: str):
+    db: Session = SessionWork()
+    try:
+        d = _device_get_or_create(db, device_id)
+        d.last_seen_at = _now()
+        db.add(d); db.commit()
+        return {"ok": True, "device_id": device_id}
     finally:
         db.close()
