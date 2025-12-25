@@ -130,7 +130,33 @@ def main():
                 raise SystemExit(f"missing kind for task_id={tid}")
 
             params = obj.get("params") or {}
-            if kind == "lean_check":
+            if kind in ("lean_check","receipt_verify","ledger_audit"):
+                # compute work_unit_id for anti-dup scheduler
+                unit_id = compute_work_unit_id(kind, params)
+                params["work_unit_id"] = unit_id
+                obj["params"] = params
+
+                # pricing: only auto-calc for lean_check (others keep declared credit_micro_total)
+                if kind == "lean_check":
+                    try:
+                        fc = int(env.get("file_count", params.get("file_count", 0)) or 0)
+                    except Exception:
+                        fc = 0
+                    def _to_int(x, default=0):
+                        try: return int(x)
+                        except Exception: return default
+                    if fc > 0:
+                        base = _to_int(params.get("credit_base_micro", 500000), 500000)
+                        per  = _to_int(params.get("credit_per_file_micro", 150000), 150000)
+                        obj["credit_micro_total"] = base + per * fc
+                        params["file_count"] = fc
+
+                allow_dup = bool(params.get("allow_duplicate_work_unit", False))
+                if not allow_dup and unit_id in seen_unit:
+                    raise SystemExit(f"duplicate work_unit_id detected (anti-dup): {unit_id} (task_id={tid})")
+                seen_unit.add(unit_id)
+
+            
                 for k in ["git_url","rev","cmd","docker_image"]:
                     if k not in params:
                         raise SystemExit(f"lean_check {tid} missing params.{k}")
