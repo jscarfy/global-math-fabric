@@ -44,6 +44,14 @@ volumes:
       - GMF_REPLAY_MISMATCH_MIN=2
       - GMF_REPLAY_SAMPLE_PCT=5
       - GMF_REPLAY_SAMPLE_PCT_RISK=50
+      - GMF_RISK_HALFLIFE_DAYS=7
+      - GMF_RISK_PENALTY_SHARED_FINGERPRINT=8
+      - GMF_RISK_PENALTY_REPLAY_MISMATCH=25
+      - GMF_RISK_REWARD_GOOD_REPLAY=-1
+      - GMF_RESULT_WEIGHT_MIN=0.25
+      - GMF_RESULT_WEIGHT_MAX=1.0
+      - GMF_REWARD_MULT_MIN=0.2
+      - GMF_REWARD_MULT_MAX=1.0
     build:
       context: .
       dockerfile: verifier-rs/Dockerfile

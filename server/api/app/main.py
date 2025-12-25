@@ -21,6 +21,7 @@ from app.schemas.receipt import ReceiptsResponse, ReceiptRow
 from app.schemas.replay import ReplayQueueResponse, ReplayQueueItem, ReplayReportRequest, ReplayReportResponse
 from app.security.signing import load_truststore, verify_bundle_ed25519
 from app.security.receipt_signing import sign_receipt
+from app.security.risk import decay_risk, fingerprint_hash, result_weight_from_risk, reward_mult_from_risk, _geti
 
 app = FastAPI(title="Global Math Fabric API")
 
@@ -38,14 +39,46 @@ def sha256_hex(b: bytes) -> str:
 def sha256_json(v: dict) -> str:
     return sha256_hex(json.dumps(v, sort_keys=True).encode("utf-8"))
 
-def require_client(db: Session, x_api_key: str | None) -> Client:
+def require_client(db: Session, x_api_key: str | None, request: Request | None = None, device_id: str | None = None) -> Client:
     if not x_api_key:
         raise HTTPException(status_code=401, detail="missing_api_key")
     api_key_hash = sha256_hex(x_api_key.encode("utf-8"))
     c = db.query(Client).filter(Client.api_key_hash == api_key_hash, Client.is_active == True).first()
     if not c:
         raise HTTPException(status_code=401, detail="invalid_api_key")
-    return c
+    
+    # --- risk decay + fingerprint update (privacy-minimal) ---
+    now = datetime.now(timezone.utc)
+    c.risk_score = decay_risk(float(getattr(c, "risk_score", 0.0)), getattr(c, "risk_updated_at", None), now)
+    c.risk_updated_at = now
+    c.last_seen_at = now
+
+    ua = None
+    ip = None
+    if request is not None:
+        ua = request.headers.get("User-Agent")
+        # best-effort client ip
+        ip = getattr(request.client, "host", None) if getattr(request, "client", None) else None
+
+    # optional device_id passed explicitly (future: from client payload)
+    if device_id:
+        c.device_id = device_id
+
+    fp = fingerprint_hash(ua, c.device_id, ip)
+    c.fingerprint_hash = fp
+
+    # sybil-ish penalty: many clients share same fingerprint
+    shared = db.query(Client).filter(Client.fingerprint_hash == fp).count()
+    penalty = _geti("GMF_RISK_PENALTY_SHARED_FINGERPRINT", 8)
+    if shared >= 3:
+        # each extra beyond 2 adds penalty/2 (gentle)
+        c.risk_score += float((shared - 2) * max(1, penalty // 2))
+        c.risk_updated_at = now
+
+    db.add(c)
+    db.commit()
+
+return c
 
 def require_verifier(x_verifier_key: str | None):
     expected = os.environ.get("GMF_VERIFIER_SHARED_KEY", "")
@@ -83,7 +116,7 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
 
 @app.get("/credits/me", response_model=MeResponse)
 def credits_me(x_api_key: str | None = Header(default=None, alias="X-API-Key"), db: Session = Depends(get_db)):
-    c = require_client(db, x_api_key)
+    c = require_client(db, x_api_key, request=request)
     return MeResponse(client_id=c.client_id, display_name=c.display_name, credits_total=c.credits_total or 0)
 
 @app.get("/credits/leaderboard", response_model=LeaderboardResponse)
@@ -289,13 +322,14 @@ def report_instance(
 
         # Bonus credits to clients whose outputs match the winning hash
         winners = list(clients_by_hash.get(winning_hash, []))
+        base_points = 5
         for winner_client_id in winners:
             # Emit signed receipt for auditability
             body = {
                 "kind": "instance_verified",
                 "instance_id": str(inst.id),
                 "stdout_sha256": winning_hash,
-                "points": 5,
+                "points": int(points),
                 "ts": datetime.utcnow().isoformat() + 'Z',
                 "client_id": winner_client_id,
             }
@@ -303,8 +337,10 @@ def report_instance(
 
             wc = db.query(Client).filter(Client.client_id == winner_client_id).first()
             if wc:
-                award(db, wc, "instance_verified", 5, {"instance_id": req.instance_id, "stdout_sha256": winning_hash})
-                db.add(Receipt(instance_id_fk=inst.id, issued_to_client_id=winner_client_id, credits_delta=5, body=body, sig_key_id=rk, signature_b64=sigb64))
+                rmult = reward_mult_from_risk(float(getattr(wc,'risk_score',0.0)))
+                points = max(1, int(round(base_points * rmult)))
+                award(db, wc, "instance_verified", points, {"instance_id": req.instance_id, "stdout_sha256": winning_hash, "rmult": rmult})
+                db.add(Receipt(instance_id_fk=inst.id, issued_to_client_id=winner_client_id, credits_delta=int(points), body=body, sig_key_id=rk, signature_b64=sigb64))
                 db.commit()
 
     return ReportResponse(accepted=True, verified_now=verified_now, note="ok")
@@ -316,7 +352,7 @@ def receipts_me(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: Session = Depends(get_db)
 ):
-    c = require_client(db, x_api_key)
+    c = require_client(db, x_api_key, request=request)
     rows = (
         db.query(Receipt)
         .filter(Receipt.issued_to_client_id == c.client_id)
@@ -341,7 +377,7 @@ def receipts_for_instance(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: Session = Depends(get_db)
 ):
-    c = require_client(db, x_api_key)
+    c = require_client(db, x_api_key, request=request)
     rows = (
         db.query(Receipt)
         .filter(Receipt.instance_id_fk == instance_id)
@@ -447,3 +483,23 @@ def replay_report(req: ReplayReportRequest, x_verifier_key: str | None = Header(
                 db.add(Receipt(instance_id_fk=inst.id, issued_to_client_id=r.issued_to_client_id, credits_delta=-int(r.credits_delta), body=body, sig_key_id=rk, signature_b64=sigb64))
         db.commit()
     return ReplayReportResponse(accepted=True, note="ok")
+
+
+def attrib_mismatch_clients(db: Session, inst: TaskInstance) -> list[Client]:
+    # determine current "winning" hash under weighted rule (what the network accepted)
+    rows = db.query(Result).filter(Result.instance_id == inst.id).all()
+    weight_sums = {}
+    for row in rows:
+        w = float(getattr(row, "weight", 1.0) or 1.0)
+        weight_sums[row.stdout_sha256] = weight_sums.get(row.stdout_sha256, 0.0) + w
+    winning = None
+    for h, wsum in weight_sums.items():
+        if wsum >= float(inst.verification_target):
+            winning = h
+            break
+    if not winning:
+        return []
+    client_ids = [r.client_id for r in rows if r.stdout_sha256 == winning]
+    if not client_ids:
+        return []
+    return db.query(Client).filter(Client.id.in_(client_ids)).all()
