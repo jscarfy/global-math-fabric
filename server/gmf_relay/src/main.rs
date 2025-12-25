@@ -341,6 +341,51 @@ fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<Value> {
     Ok(partial)
 }
 
+
+fn hard_gate_check(task: &TaskSpec, result_core: &Value) -> Option<String> {
+    let require_source_hash = task.params.get("require_source_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+    if !require_source_hash { return None; }
+
+    // expected_git_rev/tree are required if present (hard-gate)
+    let exp_rev = task.params.get("expected_git_rev").and_then(|v| v.as_str());
+    let exp_tree = task.params.get("expected_git_tree").and_then(|v| v.as_str());
+
+    if let Some(er) = exp_rev {
+        let got = result_core.get("git_rev").and_then(|v| v.as_str()).unwrap_or("");
+        if got != er { return Some(format!("expected_git_rev mismatch: expected={er} got={got}")); }
+    }
+    if let Some(et) = exp_tree {
+        let got = result_core.get("git_tree").and_then(|v| v.as_str()).unwrap_or("");
+        if got != et { return Some(format!("expected_git_tree mismatch: expected={et} got={got}")); }
+    }
+
+    // optional file hard-gates
+    for (ek, rk) in [
+        ("expected_lean_toolchain_sha256","lean_toolchain_sha256"),
+        ("expected_lakefile_sha256","lakefile_sha256"),
+        ("expected_lake_manifest_sha256","lake_manifest_sha256"),
+    ] {
+        if let Some(ev) = task.params.get(ek).and_then(|v| v.as_str()) {
+            if !ev.is_empty() {
+                let got = result_core.get(rk).and_then(|v| v.as_str()).unwrap_or("");
+                if got != ev {
+                    return Some(format!("{ek} mismatch: expected={ev} got={got}"));
+                }
+            }
+        }
+    }
+
+    // docker_image hard-gate (if task params specify it)
+    if let Some(di) = task.params.get("docker_image").and_then(|v| v.as_str()) {
+        let got = result_core.get("docker_image").and_then(|v| v.as_str()).unwrap_or("");
+        if got != di {
+            return Some(format!("docker_image mismatch: expected={di} got={got}"));
+        }
+    }
+
+    None
+}
+
 fn normalize_result_core(task: &TaskSpec, result_core: &Value) -> Value {
     let require_artifact_hash = task.params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
     let require_source_hash = task.params.get("require_source_hash").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -455,7 +500,49 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     let task = tasks.iter().find(|t| t.task_id == task_id).cloned()
         .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "unknown task_id".into()))?;
 
+    
+    // HARD-GATE: reject mismatching source pins immediately
+    if let Some(reason) = hard_gate_check(&task, &result_core) {
+        // append a 0-credit SSR for auditability, then reject (422)
+        let policy_path = PathBuf::from(env::var("GMF_POLICY_PATH").unwrap_or_else(|_| "protocol/credits/v1/CREDITS_POLICY.md".into()));
+        let policy_id = read_policy_id(&policy_path).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let server_sk_b64 = env::var("GMF_SERVER_SK_B64")
+            .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing GMF_SERVER_SK_B64".into()))?;
+
+        let receipt_payload = serde_json::json!({
+            "protocol": "gmf/ssr_payload/v1",
+            "policy_id": policy_id,
+            "device_id": device_id,
+            "task_id": task.task_id,
+            "task_kind": task.kind,
+            "task_params": task.params,
+            "result_agreement_hash": "",
+            "replica_winners": [],
+            "credits_delta_micro": 0,
+            "reason_code": "rejected_expected_source_mismatch",
+            "fraud_flag": false,
+            "reject_reason": reason,
+            "issued_at": Utc::now().to_rfc3339()
+        });
+
+        let (server_pubkey_b64, server_sig_b64) =
+            sign_ssr(&server_sk_b64, &receipt_payload)
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let ssr = ServerSignedReceipt{
+            protocol: "gmf/ssr/v1".into(),
+            receipt_payload,
+            server_pubkey_b64,
+            server_sig_b64,
+        };
+        append_ssr(&ssr)?;
+        // return SSR JSON as the error body so worker can log/store it
+        return Err((axum::http::StatusCode::UNPROCESSABLE_ENTITY, serde_json::to_string(&ssr).unwrap()));
+    }
+
     let mut subs_map = state.submissions.lock().unwrap();
+
     let subs = subs_map.entry(task.task_id.clone()).or_insert_with(Vec::new);
 
     if subs.iter().any(|s| s.device_id == device_id) {
