@@ -88,6 +88,77 @@ fn clamp_max_lines(x: usize) -> usize {
     x.min(50_000).max(1)
 }
 
+
+#[derive(Debug, Deserialize)]
+struct LedgerDeltaQuery {
+    since_unix_ms: Option<i64>,
+    max_lines: Option<usize>,
+}
+
+fn now_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+fn extract_ts_unix_ms(ssr: &serde_json::Value) -> Option<i64> {
+    // be robust: try several keys (adjust if your SSR schema uses a specific one)
+    let p = ssr.get("receipt_payload")?;
+    for k in ["server_time_unix_ms","issued_at_unix_ms","time_unix_ms","ts_unix_ms","server_time_ms","issued_at_ms","ts_ms"] {
+        if let Some(v) = p.get(k) {
+            if let Some(i) = v.as_i64() { return Some(i); }
+        }
+    }
+    // sometimes nested:
+    if let Some(v) = ssr.get("server_time_unix_ms").and_then(|v| v.as_i64()) { return Some(v); }
+    None
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
+
+fn snapshot_path(date: &str) -> PathBuf {
+    PathBuf::from("ledger/snapshots").join(format!("{date}.digest.json"))
+}
+
+fn inbox_path(date: &str) -> PathBuf {
+    PathBuf::from("ledger/inbox").join(format!("{date}.ssr.jsonl"))
+}
+
+fn compute_snapshot(date: &str) -> Result<serde_json::Value, String> {
+    let path = inbox_path(date);
+    if !path.exists() {
+        return Err("no such ledger day".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let total_bytes = bytes.len() as i64;
+    let total_lines = bytes.iter().filter(|b| **b == b'\n').count() as i64
+        + if bytes.len() > 0 && *bytes.last().unwrap() != b'\n' { 1 } else { 0 };
+
+    let digest = sha256_hex(&bytes);
+    Ok(serde_json::json!({
+        "date": date,
+        "generated_at_unix_ms": now_unix_ms(),
+        "ssr_sha256": digest,
+        "total_bytes": total_bytes,
+        "total_lines": total_lines,
+        "inbox_file": format!("ledger/inbox/{date}.ssr.jsonl")
+    }))
+}
+
+fn write_snapshot(date: &str) -> Result<serde_json::Value, String> {
+    let snap = compute_snapshot(date)?;
+    let path = snapshot_path(date);
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&snap).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(snap)
+}
+
 struct AppState {
     tasks: Arc<Mutex<Vec<TaskSpec>>>,
     assigned: Arc<Mutex<HashMap<String, Lease>>>,      // lease_key "{task_id}::{device_id}"
@@ -738,6 +809,65 @@ async fn ledger_ssr(
 }
 
 
+
+async fn ledger_snapshot(
+    axum::extract::Path(date): axum::extract::Path<String>
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    if date.len() != 10 || &date[4..5] != "-" || &date[7..8] != "-" {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into()));
+    }
+    // if snapshot exists, serve it; else generate and write it
+    let path = snapshot_path(&date);
+    if path.exists() {
+        let txt = std::fs::read_to_string(&path).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok((axum::http::StatusCode::OK, txt));
+    }
+    let snap = write_snapshot(&date).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&snap).unwrap()))
+}
+
+async fn ledger_ssr_delta(
+    axum::extract::Path(date): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LedgerDeltaQuery>
+) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, String), (axum::http::StatusCode, String)> {
+    if date.len() != 10 || &date[4..5] != "-" || &date[7..8] != "-" {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into()));
+    }
+
+    let since = q.since_unix_ms.unwrap_or(0);
+    let max_lines = q.max_lines.unwrap_or(2000).clamp(1, 50_000);
+
+    let path = inbox_path(&date);
+    if !path.exists() {
+        return Err((axum::http::StatusCode::NOT_FOUND, "no such ledger day".into()));
+    }
+    let txt = std::fs::read_to_string(&path).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut out = String::new();
+    let mut kept = 0usize;
+    let mut last_ts = since;
+
+    for ln in txt.lines() {
+        let t = ln.trim();
+        if t.is_empty() { continue; }
+        let v: serde_json::Value = match serde_json::from_str(t) { Ok(v) => v, Err(_) => continue };
+        let ts = extract_ts_unix_ms(&v).unwrap_or(0);
+        if ts >= since {
+            out.push_str(ln);
+            out.push('\n');
+            kept += 1;
+            if ts > last_ts { last_ts = ts; }
+            if kept >= max_lines { break; }
+        }
+    }
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("Content-Type", axum::http::HeaderValue::from_static("application/jsonl"));
+    headers.insert("X-GMF-KEPT-LINES", axum::http::HeaderValue::from_str(&kept.to_string()).unwrap());
+    headers.insert("X-GMF-LAST-TS-UNIX-MS", axum::http::HeaderValue::from_str(&last_ts.to_string()).unwrap());
+    Ok((axum::http::StatusCode::OK, headers, out))
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
@@ -755,9 +885,24 @@ async fn main() -> anyhow::Result<()> {
         completed_units: Arc::new(Mutex::new(HashSet::new())),
     };
 
+    // periodic daily snapshot writer (UTC date)
+    let snap_interval_secs: u64 = env::var("GMF_SNAPSHOT_INTERVAL_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(60);
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        loop {
+            let d = Utc::now();
+            let date = format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day());
+            let _ = write_snapshot(&date);
+            sleep(Duration::from_secs(snap_interval_secs)).await;
+        }
+    });
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/ledger/ssr/:date", get(ledger_ssr))
+        .route("/v1/ledger/ssr_delta/:date", get(ledger_ssr_delta))
+        .route("/v1/ledger/snapshot/:date", get(ledger_snapshot))
         .route("/v1/tasks/pull", post(pull_task))
         .route("/v1/tasks/submit", post(submit_task))
         .with_state(state);
