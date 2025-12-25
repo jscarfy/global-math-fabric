@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag="t")]
@@ -12,7 +14,7 @@ pub enum Expr {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub rule: String,
-    pub path: Vec<u32>, // indices into a[]
+    pub path: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +42,6 @@ fn nodes(e: &Expr) -> u32 {
 }
 
 fn canon_key(e: &Expr) -> String {
-    // stable canonical key (not too slow)
     match e {
         Expr::C{v} => format!("c:{v}"),
         Expr::V{n} => format!("v:{n}"),
@@ -75,12 +76,8 @@ fn rule_add_flatten(e: &mut Expr) -> bool {
             let mut out: Vec<Expr> = Vec::new();
             let mut changed = false;
             for x in a.drain(..) {
-                if let Expr::Add{a:inner} = x {
-                    out.extend(inner);
-                    changed = true;
-                } else {
-                    out.push(x);
-                }
+                if let Expr::Add{a:inner} = x { out.extend(inner); changed = true; }
+                else { out.push(x); }
             }
             *a = out;
             changed
@@ -94,12 +91,8 @@ fn rule_mul_flatten(e: &mut Expr) -> bool {
             let mut out: Vec<Expr> = Vec::new();
             let mut changed = false;
             for x in a.drain(..) {
-                if let Expr::Mul{a:inner} = x {
-                    out.extend(inner);
-                    changed = true;
-                } else {
-                    out.push(x);
-                }
+                if let Expr::Mul{a:inner} = x { out.extend(inner); changed = true; }
+                else { out.push(x); }
             }
             *a = out;
             changed
@@ -156,10 +149,7 @@ fn rule_mul_drop1(e: &mut Expr) -> bool {
 fn rule_mul_annihilate0(e: &mut Expr) -> bool {
     match e {
         Expr::Mul{a} => {
-            if a.iter().any(|x| matches!(x, Expr::C{v} if *v==0)) {
-                *e = Expr::C{v:0};
-                true
-            } else { false }
+            if a.iter().any(|x| matches!(x, Expr::C{v} if *v==0)) { *e = Expr::C{v:0}; true } else { false }
         }
         _ => false
     }
@@ -198,9 +188,7 @@ fn rule_mul_foldconst(e: &mut Expr) -> bool {
         _ => false
     }
 }
-
 fn rule_distribute_left(e: &mut Expr) -> bool {
-    // (* A (+ B C ...)) -> (+ (* A B) (* A C) ...)
     match e {
         Expr::Mul{a} if a.len()==2 => {
             let left = a[0].clone();
@@ -208,15 +196,13 @@ fn rule_distribute_left(e: &mut Expr) -> bool {
             if let Expr::Add{a:terms} = right {
                 let expanded = terms.into_iter().map(|t| Expr::Mul{a: vec![left.clone(), t]}).collect();
                 *e = Expr::Add{a: expanded};
-                return true;
-            }
-            false
+                true
+            } else { false }
         }
         _ => false
     }
 }
 fn rule_distribute_right(e: &mut Expr) -> bool {
-    // (* (+ B C ...) A) -> (+ (* B A) (* C A) ...)
     match e {
         Expr::Mul{a} if a.len()==2 => {
             let left = a[0].clone();
@@ -224,9 +210,8 @@ fn rule_distribute_right(e: &mut Expr) -> bool {
             if let Expr::Add{a:terms} = left {
                 let expanded = terms.into_iter().map(|t| Expr::Mul{a: vec![t, right.clone()]}).collect();
                 *e = Expr::Add{a: expanded};
-                return true;
-            }
-            false
+                true
+            } else { false }
         }
         _ => false
     }
@@ -250,7 +235,6 @@ fn apply_rule_at(e: &mut Expr, rule: &str) -> bool {
 }
 
 fn normalize_one_pass(e: &mut Expr, steps: &mut Vec<Step>, path: &mut Vec<u32>, max_nodes: u32) -> bool {
-    // recurse first (post-order)
     match e {
         Expr::Add{a} | Expr::Mul{a} => {
             for i in 0..a.len() {
@@ -264,7 +248,6 @@ fn normalize_one_pass(e: &mut Expr, steps: &mut Vec<Step>, path: &mut Vec<u32>, 
         _ => {}
     }
 
-    // try local rules in fixed order
     let rules = [
         "add_flatten","mul_flatten",
         "mul_annihilate0",
@@ -278,9 +261,7 @@ fn normalize_one_pass(e: &mut Expr, steps: &mut Vec<Step>, path: &mut Vec<u32>, 
         if apply_rule_at(e, r) {
             steps.push(Step{ rule: r.to_string(), path: path.clone() });
             if nodes(e) > max_nodes {
-                // revert if it explodes past bound
                 *e = before;
-                // remove step
                 steps.pop();
                 return false;
             }
@@ -299,7 +280,6 @@ pub fn solve_rw_eq_v1(start: Expr, goal: Expr, max_steps: u32, max_nodes: u32) -
     let mut cur = start.clone();
     let mut steps: Vec<Step> = Vec::new();
 
-    // deterministic normalize towards goal; we just normalize start until it equals goal or stuck or max_steps
     for _ in 0..max_steps {
         if cur == goal { break; }
         let mut path: Vec<u32> = Vec::new();
@@ -312,20 +292,72 @@ pub fn solve_rw_eq_v1(start: Expr, goal: Expr, max_steps: u32, max_nodes: u32) -
     Output::Ok{ ok, final_: cur, steps, stats }
 }
 
-pub fn replay_rw_eq_v1(start: Expr, goal: Expr, steps: &[Step], max_steps: u32, max_nodes: u32) -> Result<(), String> {
-    if steps.len() as u32 > max_steps { return Err("too many steps".into()); }
-    let mut cur = start;
-    for st in steps.iter() {
-        let sub = get_mut_at(&mut cur, &st.path).ok_or("bad path")?;
-        let before = sub.clone();
-        let changed = apply_rule_at(sub, st.rule.as_str());
-        if !changed { return Err("rule not applicable at path".into()); }
-        if nodes(&cur) > max_nodes {
-            // revert for deterministic behavior
-            *sub = before;
-            return Err("max_nodes exceeded".into());
+/* ---------- v2: canonical transcript hash (sorted keys) + pow ---------- */
+
+fn json_canon_value(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut btm: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for (k, vv) in map.iter() {
+                btm.insert(k.clone(), json_canon_value(vv));
+            }
+            let mut out = serde_json::Map::new();
+            for (k, vv) in btm.into_iter() { out.insert(k, vv); }
+            serde_json::Value::Object(out)
         }
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(json_canon_value).collect()),
+        _ => v.clone(),
     }
-    if cur != goal { return Err("final != goal".into()); }
-    Ok(())
+}
+
+pub fn transcript_sha256_hex(start: &Expr, goal: &Expr, steps: &[Step]) -> Result<String, String> {
+    let obj = serde_json::json!({
+        "start": start,
+        "goal": goal,
+        "steps": steps,
+    });
+    let canon = json_canon_value(&obj);
+    let bytes = serde_json::to_vec(&canon).map_err(|e| e.to_string())?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Ok(hex::encode(h.finalize()))
+}
+
+fn leading_zero_bits_32(d: &[u8;32]) -> u32 {
+    let mut count = 0u32;
+    for b in d.iter() {
+        if *b == 0 { count += 8; continue; }
+        count += b.leading_zeros();
+        break;
+    }
+    count
+}
+
+fn pow_hash(seed: &[u8], transcript32: &[u8;32], nonce: u64) -> [u8;32] {
+    let mut h = Sha256::new();
+    h.update(seed);
+    h.update(transcript32);
+    h.update(nonce.to_le_bytes());
+    let out = h.finalize();
+    let mut a = [0u8;32];
+    a.copy_from_slice(&out[..]);
+    a
+}
+
+pub fn solve_pow_for_transcript(seed_hex: &str, transcript_hex: &str, difficulty: u32) -> Result<(u64,String), String> {
+    let seed = hex::decode(seed_hex.trim()).map_err(|e| format!("bad seed_hex: {e}"))?;
+    let t = hex::decode(transcript_hex.trim()).map_err(|e| format!("bad transcript_hex: {e}"))?;
+    if t.len() != 32 { return Err("transcript must be 32 bytes".into()); }
+    let mut t32 = [0u8;32];
+    t32.copy_from_slice(&t[..]);
+
+    let mut nonce: u64 = 0;
+    loop {
+        let d = pow_hash(&seed, &t32, nonce);
+        if leading_zero_bits_32(&d) >= difficulty {
+            return Ok((nonce, hex::encode(d)));
+        }
+        nonce = nonce.wrapping_add(1);
+        if nonce == 0 { return Err("nonce wrapped; difficulty too high".into()); }
+    }
 }
