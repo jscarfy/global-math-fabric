@@ -329,7 +329,12 @@ async fn main() -> anyhow::Result<()> {
                 rc
             }
 
-            "final_verify" => {
+            
+            "audit_final_verify" => {
+                let rc = crate::helper_tasks::run_audit_final_verify(&relay_base_url, &task.params).await?;
+                rc
+            }
+"final_verify" => {
                 let rc = crate::helper_tasks::run_final_verify(&relay_base_url, &task.params).await?;
 
                 // Auto-attest (default true) — writes a server-signed audit receipt
