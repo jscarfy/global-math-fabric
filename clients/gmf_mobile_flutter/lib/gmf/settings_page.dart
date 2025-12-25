@@ -8,6 +8,7 @@ import 'account_store.dart';
 import 'account_api.dart';
 import 'resource_limits_store.dart';
 import 'consent_store.dart';
+import 'share_install.dart';
 
 class GmfSettingsPage extends StatefulWidget {
   const GmfSettingsPage({super.key});
@@ -187,7 +188,13 @@ class _GmfSettingsPageState extends State<GmfSettingsPage> {
             ),
           ),
 
-          ListTile(title: const Text('Account')),
+          ListTile(
+  title: const Text('Share install link'),
+  subtitle: const Text('Send your friends the one-click install page'),
+  onTap: () async { await ShareInstall.shareLanding(); },
+),
+
+ListTile(title: const Text('Account')),
           if (_accountId != null) Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Text('account_id: '+_accountId!),
