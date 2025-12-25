@@ -161,6 +161,43 @@ def pull_job(device_id: str, topics: str = ""):
         # policy hash binding: client must echo current policy_hash
         sub = submit_obj if 'submit_obj' in locals() else (submission if 'submission' in locals() else {})
         submitted_policy = sub.get('policy_hash')
+        # device signature verification (anti-credit-theft)
+        device_sig_alg = (sub.get('device_sig_alg') or sub.get('sig_alg') or 'ed25519').strip().lower()
+        device_sig_b64 = (sub.get('device_sig') or sub.get('sig') or '').strip()
+        # load device pubkey from DB (if present)
+        dev_pub = ''
+        try:
+            dev = _device_get_or_none(db, device_id) if '_device_get_or_none' in globals() else None
+            dev_pub = (getattr(dev, 'device_pubkey_ed25519', '') or '').strip().lower() if dev is not None else ''
+        except Exception:
+            dev_pub = ''
+        # Build canonical signed message (covers policy+nonce+merkle fields)
+        sig_msg_obj = {
+            'device_id': device_id,
+            'lease_id': lease_id,
+            'job_id': job_id,
+            'policy_hash': submitted_policy,
+            'challenge_nonce': sub.get('challenge_nonce') or sub.get('nonce'),
+            'bundle_format': sub.get('bundle_format'),
+            'header_sha256': sub.get('header_sha256'),
+            'merkle_root_hex': sub.get('merkle_root_hex') or sub.get('lean_trace_merkle_root'),
+            'num_chunks': sub.get('num_chunks'),
+            'sample_indices': [int(x.get('idx')) for x in (sub.get('samples') or []) if isinstance(x, dict) and 'idx' in x],
+            'output': sub.get('output'),
+        }
+        sig_msg = _canon_sig_message(sig_msg_obj)
+        # Enforce if required, or if device has pubkey on file
+        if (GMF_REQUIRE_DEVICE_SIG or dev_pub):
+            if not dev_pub:
+                accepted = False; reason = 'device_pubkey_missing'; awarded_credits = 0
+            elif not device_sig_b64:
+                accepted = False; reason = 'device_sig_missing'; awarded_credits = 0
+            elif device_sig_alg != 'ed25519':
+                accepted = False; reason = 'device_sig_alg_unsupported'; awarded_credits = 0
+            else:
+                ok = _verify_device_sig_ed25519(dev_pub, sig_msg, device_sig_b64)
+                if not ok:
+                    accepted = False; reason = 'device_sig_invalid'; awarded_credits = 0
         if not submitted_policy:
             accepted = False
             reason = 'policy_hash_missing'
@@ -253,7 +290,14 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict, device_
             raise HTTPException(status_code=400, detail="invalid_lease")
         if lease.expires_at < _now():
             lease.active = False
-            db.commit()
+            # store pubkey if provided
+        if device_pubkey_ed25519:
+            try:
+                dev.device_pubkey_ed25519 = device_pubkey_ed25519
+                dev.pubkey_updated_ts_utc = ts_utc
+            except Exception:
+                pass
+        db.commit()
             raise HTTPException(status_code=400, detail="lease_expired")
 
         job = db.query(Job).filter(Job.job_id == job_id).first()
@@ -733,3 +777,22 @@ def policy_text(policy_hash: str):
     txt = pth.read_text(encoding="utf-8", errors="replace")
     # serve as plain text
     return PlainTextResponse(txt, media_type="text/plain; charset=utf-8")
+
+GMF_REQUIRE_DEVICE_SIG = os.environ.get('GMF_REQUIRE_DEVICE_SIG','0').strip() in ('1','true','TRUE','yes','YES')
+
+GMF_DEVICE_SIG_ALG = os.environ.get('GMF_DEVICE_SIG_ALG','ed25519').strip().lower()
+
+def _canon_sig_message(obj: dict) -> bytes:
+    # Canonical JSON bytes (stable for signature)
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+def _verify_device_sig_ed25519(pubkey_hex: str, msg: bytes, sig_b64: str) -> bool:
+    if Ed25519PublicKey is None:
+        return False
+    try:
+        pk = bytes.fromhex(pubkey_hex.strip().lower())
+        sig = base64.b64decode(sig_b64)
+        Ed25519PublicKey.from_public_bytes(pk).verify(sig, msg)
+        return True
+    except Exception:
+        return False

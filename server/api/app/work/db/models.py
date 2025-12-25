@@ -84,5 +84,7 @@ class LeaseChallenge(Base):
     seed_hex = Column(String, nullable=False, default="")  # sha256(lease_id|nonce)
     audit_required = Column(Integer, nullable=False, default=0)  # 0/1
     required_fields_csv = Column(Text, nullable=False, default="")  # e.g. "lean_trace_hash"
+    device_pubkey_ed25519 = Column(String, nullable=False, default="")
+    pubkey_updated_ts_utc = Column(String, nullable=False, default="")
     created_ts_utc = Column(String, nullable=False)
 
