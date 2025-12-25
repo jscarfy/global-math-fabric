@@ -1,0 +1,78 @@
+name: release-android-play
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Patch Flutter version from tag (x.y.z+run_number)
+        run: |
+          ./scripts/release/patch_flutter_version_from_tag.sh "${GITHUB_REF_NAME}" "${GITHUB_RUN_NUMBER}" clients/gmf_mobile_flutter/pubspec.yaml
+
+      - name: Decode Android keystore (signing)
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd clients/gmf_mobile_flutter
+          mkdir -p android/app/keystore
+          echo "$ANDROID_KEYSTORE_B64" | base64 -d > android/app/keystore/upload-keystore.jks
+          cat > android/key.properties <<EOF
+storePassword=$ANDROID_KEYSTORE_PASSWORD
+keyPassword=$ANDROID_KEY_PASSWORD
+keyAlias=$ANDROID_KEY_ALIAS
+storeFile=app/keystore/upload-keystore.jks
+EOF
+
+      - name: Build signed release APK + AAB
+        run: |
+          cd clients/gmf_mobile_flutter
+          flutter pub get
+          flutter build apk --release
+          flutter build appbundle --release
+          ls -lh build/app/outputs/flutter-apk/app-release.apk
+          ls -lh build/app/outputs/bundle/release/app-release.aab
+
+      - name: Stage APK into releases/android + sha256 (Pages sideload)
+        run: |
+          mkdir -p releases/android
+          cp -f clients/gmf_mobile_flutter/build/app/outputs/flutter-apk/app-release.apk releases/android/latest.apk
+          ./scripts/release/sha256_file.sh releases/android/latest.apk releases/android/latest.apk.sha256
+
+      - name: Upload AAB to Google Play internal track (fastlane supply)
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON_B64 }}
+          PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}
+        run: |
+          cd clients/gmf_mobile_flutter/android
+          mkdir -p /tmp/gmf_play
+          echo "$PLAY_SERVICE_ACCOUNT_JSON_B64" | base64 -d > /tmp/gmf_play/service_account.json
+
+          bundle install --path vendor/bundle
+          AAB_PATH="$(cd .. && pwd)/build/app/outputs/bundle/release/app-release.aab"
+          PLAY_JSON_KEY_FILE="/tmp/gmf_play/service_account.json"
+          export AAB_PATH PACKAGE_NAME PLAY_JSON_KEY_FILE
+          bundle exec fastlane android internal
+
+      - name: Commit APK + sha256 back to main (for GitHub Pages)
+        run: |
+          git config user.name "gmf-bot"
+          git config user.email "gmf-bot@users.noreply.github.com"
+          git add releases/android/latest.apk releases/android/latest.apk.sha256 clients/gmf_mobile_flutter/pubspec.yaml
+          git commit -m "release: publish android apk + version bump for ${GITHUB_REF_NAME}" || true
+          git push origin HEAD:main || true
