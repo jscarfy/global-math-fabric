@@ -110,3 +110,7 @@ msix_config:
   identity_name: com.globalmathfabric.gmf
   msix_version: 0.1.0.0
   capabilities: internetClient
+
+flutter:
+  assets:
+    - assets/tray/
