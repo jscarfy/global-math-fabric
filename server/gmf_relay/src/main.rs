@@ -164,6 +164,23 @@ fn append_ssr(ssr: &ServerSignedReceipt) -> Result<(), (axum::http::StatusCode, 
     Ok(())
 }
 
+
+fn normalize_result_core(task: &TaskSpec, result_core: &Value) -> Value {
+    // if require_artifact_hash=false: ignore artifacts_manifest_sha256/count/log hash for agreement
+    let require_hash = task.params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+    if require_hash {
+        return result_core.clone();
+    }
+    let ok = result_core.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let exit_code = result_core.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(9999);
+    let docker_image = result_core.get("docker_image").cloned().unwrap_or(Value::String("".into()));
+    serde_json::json!({
+        "ok": ok,
+        "exit_code": exit_code,
+        "docker_image": docker_image
+    })
+}
+
 fn run_cmd(mut cmd: Command) -> anyhow::Result<(i32, String)> {
     let out = cmd.output()?;
     let code = out.status.code().unwrap_or(1);
@@ -173,21 +190,23 @@ fn run_cmd(mut cmd: Command) -> anyhow::Result<(i32, String)> {
     Ok((code, s))
 }
 
-fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<(bool, i32, String)> {
+fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<Value> {
     let params = &task.params;
     let git_url = params.get("git_url").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing git_url"))?;
     let rev = params.get("rev").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing rev"))?;
     let subdir = params.get("subdir").and_then(|v| v.as_str()).unwrap_or("");
     let use_cache = params.get("use_mathlib_cache").and_then(|v| v.as_bool()).unwrap_or(true);
+    let artifacts_root = params.get("artifacts_root").and_then(|v| v.as_str()).unwrap_or(".lake/build/lib");
+    let docker_image = params.get("docker_image").and_then(|v| v.as_str())
+        .unwrap_or(&env::var("GMF_LEAN_IMAGE").unwrap_or_else(|_| "leanprovercommunity/lean:latest".into()));
+
+    let require_artifact_hash = params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned()
         .unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
     let cmd_vec: Vec<String> = cmd_arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
     if cmd_vec.is_empty() { return Err(anyhow::anyhow!("empty cmd")); }
 
-    let lean_image = env::var("GMF_LEAN_IMAGE").unwrap_or_else(|_| "leanprovercommunity/lean:latest".into());
-
-    // clone into temp dir
     let dir = tempdir()?;
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo)?;
@@ -202,24 +221,75 @@ fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<(bool, i32, String)> {
         return Err(anyhow::anyhow!("subdir does not exist: {}", workdir.display()));
     }
 
-    let mut bash = String::new();
-    if use_cache {
-        bash.push_str("lake exe cache get && ");
-    }
-    bash.push_str(&cmd_vec.join(" "));
+    let bash = format!(r#"
+set +e
+cd /workspace/{subdir}
+LOG="/workspace/.gmf_build.log"
+RES="/workspace/.gmf_result_core.json"
+ARTROOT="/workspace/{subdir}/{artifacts_root}"
+
+( {cache_cmd} {cmd} ) >"$LOG" 2>&1
+RC=$?
+
+BLH=$(sha256sum "$LOG" | awk '{{print $1}}')
+
+OK=false
+if [ "$RC" -eq 0 ]; then OK=true; fi
+
+ART_COUNT=0
+ART_MANIFEST_SHA=""
+if {require_hash}; then
+  if [ -d "$ARTROOT" ]; then
+    MAN="/workspace/.gmf_artifacts.manifest"
+    (cd "$ARTROOT" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$MAN"
+    ART_COUNT=$(wc -l < "$MAN" | tr -d ' ')
+    ART_MANIFEST_SHA=$(sha256sum "$MAN" | awk '{{print $1}}')
+  else
+    OK=false
+    RC=2
+    ART_COUNT=0
+    ART_MANIFEST_SHA=""
+  fi
+fi
+
+cat > "$RES" <<EOF
+{{"ok":$OK,"exit_code":$RC,"build_log_sha256":"$BLH","artifacts_root":"{artifacts_root}","artifacts_count":$ART_COUNT,"artifacts_manifest_sha256":"$ART_MANIFEST_SHA","docker_image":"{docker_image}"}}
+EOF
+
+exit 0
+"#,
+        subdir=subdir,
+        artifacts_root=artifacts_root,
+        docker_image=docker_image,
+        cmd=" ".join(cmd_vec),
+        cache_cmd="lake exe cache get &&" if use_cache else "",
+        require_hash="true" if require_artifact_hash else "false",
+    );
 
     let (code, log) = run_cmd(
         Command::new("docker")
             .arg("run").arg("--rm")
             .arg("-v").arg(format!("{}:/workspace", repo.display()))
-            .arg("-w").arg(format!("/workspace/{}", subdir))
-            .arg(lean_image)
+            .arg("-w").arg("/workspace")
+            .arg(docker_image)
             .arg("bash").arg("-lc").arg(bash)
     )?;
+    if code != 0 {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "exit_code": 127,
+            "build_log_sha256": hex::encode(sha256(log.as_bytes())),
+            "artifacts_root": artifacts_root,
+            "artifacts_count": 0,
+            "artifacts_manifest_sha256": "",
+            "docker_image": docker_image
+        }));
+    }
 
-    let ok = code == 0;
-    let log_hash = hex::encode(sha256(log.as_bytes()));
-    Ok((ok, code, log_hash))
+    let result_path = repo.join(".gmf_result_core.json");
+    let txt = fs::read_to_string(&result_path)?;
+    let v: Value = serde_json::from_str(&txt)?;
+    Ok(v)
 }
 
 async fn pull_task(state: axum::extract::State<AppState>, Json(req): Json<PullRequest>)
@@ -331,7 +401,8 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     // bucket by canonical hash of result_core
     let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
     for s in subs.iter() {
-        let canon = jcs_canonicalize(&s.result_core);
+        let norm = normalize_result_core(&task, &s.result_core);
+        let canon = jcs_canonicalize(&norm);
         let h = hex::encode(sha256(&canon));
         buckets.entry(h).or_default().push(s.device_id.clone());
     }
@@ -345,19 +416,19 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     let do_spot = rand::thread_rng().gen::<f64>() < rate;
     let mut spot = serde_json::json!({"performed": do_spot});
 
+    let mut spot_result_core: Option<Value> = None;
     let mut spot_ok: Option<bool> = None;
     let mut spot_exit: Option<i32> = None;
     let mut spot_log_hash: Option<String> = None;
 
     if do_spot && task.kind == "lean_check" {
         match spotcheck_lean(&task) {
-            Ok((ok, exit_code, log_hash)) => {
-                spot_ok = Some(ok);
-                spot_exit = Some(exit_code);
-                spot_log_hash = Some(log_hash);
-                spot["ok"] = Value::Bool(ok);
-                spot["exit_code"] = Value::Number(exit_code.into());
-                spot["log_sha256"] = Value::String(spot_log_hash.clone().unwrap());
+            Ok(rcore) => {
+                spot_result_core = Some(rcore.clone());
+                spot_ok = rcore.get("ok").and_then(|v| v.as_bool());
+                spot_exit = rcore.get("exit_code").and_then(|v| v.as_i64()).map(|x| x as i32);
+                spot_log_hash = rcore.get("build_log_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+                spot["result_core"] = rcore;
             }
             Err(e) => {
                 // inconclusive: do not penalize
@@ -374,10 +445,10 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     let per_device = (task.credit_micro_total / task.replicas.max(1)) as i64;
 
     // compare spot-check with agreed result (only if spot had a conclusive ok/exit_code)
-    let fraud = if let (Some(ok), Some(exit_code)) = (spot_ok, spot_exit) {
-        let agreed_ok = result_core.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-        let agreed_exit = result_core.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(9999) as i32;
-        ok != agreed_ok || exit_code != agreed_exit
+    let fraud = if let Some(spot_core) = spot_result_core.as_ref() {
+        let a = normalize_result_core(&task, &result_core);
+        let b = normalize_result_core(&task, spot_core);
+        a != b
     } else {
         false
     };
