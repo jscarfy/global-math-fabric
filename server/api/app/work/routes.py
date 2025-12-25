@@ -1,3 +1,4 @@
+from fastapi.responses import JSONResponse
 import random
 import base64
 import hashlib
@@ -626,3 +627,73 @@ def _load_policy_hash() -> tuple[str,str]:
         return (h, policy_name)
 
 GMF_POLICY_HASH, GMF_POLICY_NAME = _load_policy_hash()
+
+def _policy_registry_path() -> Path:
+    return Path("ledger/policies/registry.json")
+
+def _build_policy_registry_obj() -> dict:
+    pol_dir = Path("ledger/policies")
+    items = []
+    if pol_dir.exists():
+        for f in sorted(pol_dir.glob("*.md")):
+            try:
+                b = f.read_bytes()
+                items.append({"name": f.name, "relpath": str(f), "sha256": hashlib.sha256(b).hexdigest(), "bytes": len(b)})
+            except Exception:
+                continue
+    return {"kind":"gmf_policy_registry","version":1,"policies":items}
+
+def _load_or_build_policy_registry() -> dict:
+    rp = _policy_registry_path()
+    if rp.exists():
+        try:
+            return json.loads(rp.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    obj = _build_policy_registry_obj()
+    try:
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return obj
+
+@router.get("/policy/current")
+def policy_current():
+    # policy hash/name computed at import time (GMF_POLICY_HASH/GMF_POLICY_NAME)
+    # policy_path returned for transparency; clients should not rely on filesystem existence.
+    try:
+        pb = Path(GMF_POLICY_PATH).read_bytes()
+        pb_sha = hashlib.sha256(pb).hexdigest()
+    except Exception:
+        pb_sha = hashlib.sha256(f"MISSING:{GMF_POLICY_PATH}".encode("utf-8")).hexdigest()
+
+    return JSONResponse({
+        "ok": True,
+        "policy_hash": GMF_POLICY_HASH,
+        "policy_name": GMF_POLICY_NAME,
+        "policy_path": GMF_POLICY_PATH,
+        "policy_bytes_sha256": pb_sha,
+    })
+
+@router.get("/policy/registry")
+def policy_registry():
+    obj = _load_or_build_policy_registry()
+    return JSONResponse({"ok": True, "registry": obj})
+
+@router.get("/policy/by_hash/{policy_hash}")
+def policy_by_hash(policy_hash: str):
+    policy_hash = (policy_hash or "").strip().lower()
+    reg = _load_or_build_policy_registry()
+    hit = None
+    for it in reg.get("policies", []):
+        if str(it.get("sha256","")).lower() == policy_hash:
+            hit = it
+            break
+    return JSONResponse({
+        "ok": True,
+        "query_hash": policy_hash,
+        "found": bool(hit),
+        "policy": hit,
+        "hint": "Fetch policy file content via git mirror path in 'relpath' (policy text not served here).",
+    })
