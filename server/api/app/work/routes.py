@@ -203,6 +203,9 @@ def pull_job(device_id: str, topics: str = ""):
                     audit_chunk_size=audit_chunk_size,
                     audit_sample_idx0_included=audit_idx0,
                     awarded_credits=int(awarded_credits),
+                    transcript_sha256=str((json.loads(str(output)).get('transcript_sha256','') if str(output).strip().startswith('{') else '')),
+                    pow_hash_hex=str((json.loads(str(output)).get('pow_hash_hex','') if str(output).strip().startswith('{') else '')),
+                    checkpoints_root_hex=str((json.loads(str(output)).get('checkpoints_root_hex','') if str(output).strip().startswith('{') else '')),
                 )
         except Exception as _e:
             # never fail submit due to ledger write; but keep logs

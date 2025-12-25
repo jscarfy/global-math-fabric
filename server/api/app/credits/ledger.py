@@ -149,6 +149,7 @@ def record_receipt_v1(
         "policy_hash": policy_hash,
         "verifier": {"name": verifier_name, "version": verifier_version, "digest_sha256": verifier_digest_sha256},
         "job": {"job_id": job_id, "lease_id": lease_id, "job_kind": job_kind, "input_sha256": input_sha, "output_sha256": output_sha},
+        "job_ext": {"transcript_sha256": "", "pow_hash_hex": "", "checkpoints_root_hex": ""},
         "device": {"device_pk_ed25519": device_pk_ed25519, "device_sig_over_submit_sha256": device_sig_over_submit_sha256},
         "audit": {"rate": audit_rate, "sample_idx0_included": bool(audit_sample_idx0_included), "chunk_size": int(audit_chunk_size)},
         "credits": {"awarded_i64": int(awarded_credits), "unit":"gmf_credit_v1"},
