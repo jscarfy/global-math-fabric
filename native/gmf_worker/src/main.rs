@@ -93,6 +93,20 @@ fn solve_lean_check(task: &Value) -> anyhow::Result<Value> {
     let artifacts_root = params.get("artifacts_root").and_then(|v| v.as_str()).unwrap_or(".lake/build/lib");
     let docker_image = params.get("docker_image").and_then(|v| v.as_str()).unwrap_or("leanprovercommunity/lean:latest");
 
+    let require_digest = params.get("require_digest").and_then(|v| v.as_bool()).unwrap_or(true);
+    if require_digest && !docker_image.contains("@sha256:") {
+        // deterministic failure: unpinned docker image
+        return Ok(serde_json::json!({
+            "ok": false,
+            "exit_code": 3,
+            "build_log_sha256": hex::encode(sha256(b"docker_image_not_digest_pinned")),
+            "artifacts_root": artifacts_root,
+            "artifacts_count": 0,
+            "artifacts_manifest_sha256": "",
+            "docker_image": docker_image
+        }));
+    }
+
     let require_artifact_hash = params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned()
