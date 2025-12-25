@@ -505,3 +505,75 @@ pub async fn run_final_verify(relay_base: &str, params: &Value) -> Result<Value>
         "relay_base_url": relay_base
     }))
 }
+
+
+async fn fetch_audit_final_json(relay_base: &str, date: &str) -> Result<serde_json::Value> {
+    let url = format!("{}/v1/audit/final/{}", relay_base.trim_end_matches('/'), date);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PAGE_TIMEOUT_SECS))
+        .build()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("audit_final fetch failed: {}", resp.status()));
+    }
+    let txt = resp.text().await?;
+    Ok(serde_json::from_str(&txt)?)
+}
+
+fn verify_audit_final_sig(audit_final_env: &Value) -> Result<bool> {
+    let payload = audit_final_env.get("audit_final_payload").ok_or_else(|| anyhow!("missing audit_final_payload"))?;
+    let pk_b64 = audit_final_env.get("server_pubkey_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_pubkey_b64"))?;
+    let sig_b64 = audit_final_env.get("server_sig_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_sig_b64"))?;
+
+    let pk_bytes = B64.decode(pk_b64)?;
+    let pk = VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| anyhow!("bad pk bytes"))?)
+        .map_err(|_| anyhow!("bad pk"))?;
+
+    let sig_bytes = B64.decode(sig_b64)?;
+    let sig = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| anyhow!("bad sig bytes"))?);
+
+    let canon = canonical_json_bytes_local(payload);
+    let msg = Sha256::digest(&canon);
+
+    Ok(pk.verify(&msg, &sig).is_ok())
+}
+
+pub async fn run_audit_final_verify(relay_base: &str, params: &Value) -> Result<Value> {
+    let date = params.get("date").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing params.date"))?;
+    let verify_audit_log = params.get("verify_audit_log").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let env = fetch_audit_final_json(relay_base, date).await?;
+    let sig_ok = verify_audit_final_sig(&env)?;
+
+    let pk_b64 = env.get("server_pubkey_b64").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let canonical_pk = read_canonical_pubkey_b64();
+    let pk_match = canonical_pk.as_ref().map(|c| c == &pk_b64);
+
+    let expected_log_sha = env.get("audit_final_payload")
+        .and_then(|p| p.get("audit_log_sha256")).and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let mut audit_log_match = None;
+    if verify_audit_log {
+        if let Some(exp) = expected_log_sha.as_ref() {
+            let path = std::path::PathBuf::from("ledger/audit").join(format!("{}.audit.jsonl", date));
+            if path.exists() {
+                let bytes = std::fs::read(&path)?;
+                let got = sha256_hex_bytes(&bytes);
+                audit_log_match = Some(&got == exp);
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "ok": sig_ok && pk_match.unwrap_or(true) && audit_log_match.unwrap_or(true),
+        "exit_code": if sig_ok && pk_match.unwrap_or(true) && audit_log_match.unwrap_or(true) { 0 } else { 2 },
+        "date": date,
+        "audit_final_sig_ok": sig_ok,
+        "server_pubkey_b64": pk_b64,
+        "canonical_pubkey_b64": canonical_pk,
+        "pubkey_matches_canonical": pk_match,
+        "expected_audit_log_sha256": expected_log_sha,
+        "audit_log_sha_matches_audit_final": audit_log_match,
+        "relay_base_url": relay_base
+    }))
+}
