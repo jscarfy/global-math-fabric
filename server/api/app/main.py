@@ -30,6 +30,7 @@ from app.accounts.routes import router as accounts_router
 from app.invites.routes import router as invites_router
 from app.antisybil.routes import router as antisybil_router
 from app.merkle.routes import router as merkle_router
+from app.dailyroot.routes import router as daily_root_router
 from app.devices.routes import router as devices_router
 from app.credits import router as credits_router
 from app.enroll import router as enroll_router
@@ -1223,6 +1224,7 @@ app.include_router(accounts_router)
 app.include_router(invites_router)
 app.include_router(antisybil_router)
 app.include_router(merkle_router)
+app.include_router(daily_root_router)
 app.include_router(devices_router)
 
 # Credits API
