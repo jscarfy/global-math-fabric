@@ -77,6 +77,7 @@ volumes:
       - GMF_PREWARM_BUDGET=200000
       - GMF_CHECKPOINT_PREWARM_ENABLED=1
       - GMF_CHECKPOINT_PREWARM_BUDGET=50000
+      - GMF_LEAN_WORKER_URL=http://lean_worker:8090
       - GMF_LEDGER_CHECKPOINTS_DIR=ledger/checkpoints
       - GMF_LEDGER_PENDING_DIR=ledger/pending_checkpoints
       - GMF_CREDITS_BASE_HEAVY=5
@@ -107,3 +108,12 @@ volumes:
       - GMF_VERIFIER_SHARED_KEY=dev-verifier-key
     depends_on:
       - api
+
+
+  lean_worker:
+    build:
+      context: ./server/lean_worker
+    environment:
+      - LEAN_TIMEOUT_SEC=20
+    ports:
+      - "8090:8090"

@@ -9,6 +9,7 @@ from app.crypto.ledger import append_envelope_line
 from app.crypto.governance import load_governance_or_die
 
 from .validators.toy_math import validate as validate_toy_math
+from .validators.lean_check import validate as validate_lean_check
 
 router = APIRouter(prefix="/work", tags=["work"])
 
@@ -26,6 +27,8 @@ def _canon(obj) -> str:
 def _validator_for(kind: str):
     if kind == "toy_math":
         return validate_toy_math
+    if kind == "lean_check":
+        return validate_lean_check
     return None
 
 @router.post("/jobs/create")
