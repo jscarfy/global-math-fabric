@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'gmf/consent_store.dart';
+import 'gmf/consent_screen.dart';
 import 'package:flutter/material.dart';
 import 'gmf/ios_bg_channel.dart';
 import 'gmf/settings_page.dart';
@@ -152,8 +154,8 @@ class _AppState extends State<App> {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'GMF Mobile',
-      home: Scaffold(
-        appBar: AppBar(title: const Text('Global Math Fabric (Mobile)')),
+      home: _GMFConsentGate(child: Scaffold(
+        appBar: AppBar(title: const Text('Global Math Fabric (Mobile)'))),
         body: Padding(
           padding: const EdgeInsets.all(16),
           child: ListView(
@@ -195,3 +197,25 @@ class _AppState extends State<App> {
     );
   }
 }
+
+
+class _GMFConsentGate extends StatelessWidget {
+  final Widget child;
+  const _GMFConsentGate({required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<bool>(
+      future: ConsentStore.hasConsent(),
+      builder: (context, snap) {
+        final ok = snap.data == true;
+        if (ok) return child;
+        // show consent screen first
+        return Builder(
+          builder: (context) => ConsentScreen(),
+        );
+      },
+    );
+  }
+}
+
