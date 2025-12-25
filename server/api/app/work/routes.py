@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 import random
 import base64
 import hashlib
+from app.devices.store import get_device
 from app.work.db.models import LeaseUse, LeaseChallenge
 import os
 from app.credits.ledger import record_receipt_v1
@@ -1852,4 +1853,8 @@ def _verify_device_sig_v1(job_id: str, lease_id: str, output_sha256_hex: str, de
         return (False, "invalid_device_signature")
     except Exception:
         return (False, "bad_device_signature_payload")
+
+
+
+_RATE_LIMIT = {}
 
