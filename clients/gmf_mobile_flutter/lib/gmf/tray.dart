@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:flutter/material.dart';
 import 'platform_runner.dart';
@@ -10,7 +11,7 @@ class GMFTray with TrayListener {
     TrayManager.instance.addListener(_i);
     // You should provide platform-specific tray icon files; placeholder name.
     // Put icons under assets/ and register in pubspec.yaml if needed.
-    await TrayManager.instance.setIcon('assets/tray/icon.png');
+    await TrayManager.instance.setIcon(Platform.isWindows ? 'assets/tray/icon.ico' : 'assets/tray/icon.png');
     await TrayManager.instance.setToolTip('Global Math Fabric');
     await TrayManager.instance.setContextMenu(Menu(items: [
       MenuItem(key: 'pause', label: 'Pause Background'),
