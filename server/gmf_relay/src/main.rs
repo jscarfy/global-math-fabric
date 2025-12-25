@@ -15,6 +15,23 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
+
+    // expose server signing closure for final snapshot signing (msg is SHA256(payload_canon))
+    let server_pubkey_b64_str = {
+        // reuse whatever you already put into SSR for server_pubkey_b64 if available
+        // fallback: keep empty and patch manually if needed
+        String::new()
+    };
+
+    let server_sign_fn: std::sync::Arc<dyn Fn(&[u8]) -> String + Send + Sync> =
+        std::sync::Arc::new(move |msg: &[u8]| {
+            // NOTE: patch this block to match your SSR signing implementation if it differs
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            use ed25519_dalek::Signer;
+            // signing_key must be in scope in your file; if not, manually wire it.
+            let sig = signing_key.sign(msg);
+            B64.encode(sig.to_bytes())
+        });
 use gmf_receipts::{jcs_canonicalize, sha256, sha256_hex};
 use rand::Rng;
 use tempfile::tempdir;
@@ -953,6 +970,24 @@ fn write_final_snapshot_once(
     Ok(env)
 }
 
+
+async fn ledger_finalize(
+    axum::extract::Path(date): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String,String>>
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    let admin = std::env::var("GMF_ADMIN_TOKEN").unwrap_or_default();
+    let tok = q.get("token").cloned().unwrap_or_default();
+    if !admin.is_empty() && tok != admin {
+        return Err((axum::http::StatusCode::FORBIDDEN, "forbidden".into()));
+    }
+    if date.len()!=10 { return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into())); }
+
+    // NOTE: you must set server_pubkey_b64_str + server_sign_fn correctly (see previous step)
+    let env = write_final_snapshot_once(&date, &server_pubkey_b64_str, server_sign_fn.as_ref())
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
@@ -988,6 +1023,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ledger/ssr/:date", get(ledger_ssr))
         .route("/v1/ledger/ssr_delta/:date", get(ledger_ssr_delta))
         .route("/v1/ledger/snapshot/:date", get(ledger_snapshot))
+        .route("/v1/ledger/finalize/:date", get(ledger_finalize))
         .route("/v1/tasks/pull", post(pull_task))
         .route("/v1/tasks/submit", post(submit_task))
         .with_state(state);
