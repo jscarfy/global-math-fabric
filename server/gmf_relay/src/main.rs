@@ -1145,6 +1145,114 @@ async fn audit_log(
     Ok((axum::http::StatusCode::OK, txt))
 }
 
+
+fn audit_summary_path(date: &str) -> PathBuf {
+    PathBuf::from("ledger/audit").join(format!("{date}.audit_summary.json"))
+}
+
+fn compute_audit_summary(date: &str) -> Result<serde_json::Value, String> {
+    let auditp = audit_path(date);
+    if !auditp.exists() { return Err("no audit log".into()); }
+
+    let txt = std::fs::read_to_string(&auditp).map_err(|e| e.to_string())?;
+    let mut total = 0i64;
+    let mut sig_ok = 0i64;
+    let mut sig_bad = 0i64;
+    let mut parse_err = 0i64;
+
+    let mut unique_devices = std::collections::HashSet::<String>::new();
+    let mut unique_pubkeys = std::collections::HashSet::<String>::new();
+
+    // verify each audit_env server_sig (defensive)
+    for line in txt.lines() {
+        let t = line.trim();
+        if t.is_empty() { continue; }
+        total += 1;
+
+        let v: serde_json::Value = match serde_json::from_str(t) {
+            Ok(x) => x,
+            Err(_) => { parse_err += 1; continue; }
+        };
+
+        let payload = match v.get("audit_payload") { Some(p) => p, None => { parse_err += 1; continue; } };
+        if let Some(d) = payload.get("device_id").and_then(|x| x.as_str()) { unique_devices.insert(d.to_string()); }
+        if let Some(pk) = payload.get("device_pubkey_b64").and_then(|x| x.as_str()) { unique_pubkeys.insert(pk.to_string()); }
+
+        // verify signature: SHA256(canonical_json_bytes(audit_payload)) signed by audit_env.server_pubkey_b64
+        let pk_b64 = v.get("server_pubkey_b64").and_then(|x| x.as_str()).unwrap_or("");
+        let sig_b64 = v.get("server_sig_b64").and_then(|x| x.as_str()).unwrap_or("");
+
+        // best-effort verify; if your relay already has a generic verify fn, swap to it
+        match (base64::engine::general_purpose::STANDARD.decode(pk_b64),
+               base64::engine::general_purpose::STANDARD.decode(sig_b64)) {
+            (Ok(pk_bytes), Ok(sig_bytes)) => {
+                if pk_bytes.len()==32 && sig_bytes.len()==64 {
+                    if let (Ok(pk), Ok(sig_arr)) = (
+                        ed25519_dalek::VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap()),
+                        <[u8;64]>::try_from(sig_bytes.as_slice())
+                    ) {
+                        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+                        let canon = canonical_json_bytes(payload);
+                        let msg = sha2::Sha256::digest(&canon);
+                        if pk.verify(&msg, &sig).is_ok() { sig_ok += 1; } else { sig_bad += 1; }
+                    } else { sig_bad += 1; }
+                } else { sig_bad += 1; }
+            }
+            _ => { sig_bad += 1; }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "date": date,
+        "generated_at_unix_ms": now_unix_ms(),
+        "audit_total": total,
+        "audit_parse_errors": parse_err,
+        "audit_sig_ok": sig_ok,
+        "audit_sig_bad": sig_bad,
+        "unique_devices": unique_devices.len(),
+        "unique_device_pubkeys": unique_pubkeys.len()
+    }))
+}
+
+fn write_audit_summary(date: &str) -> Result<serde_json::Value, String> {
+    let summary = compute_audit_summary(date)?;
+    // sign summary payload (same pattern as final/snapshot)
+    let canon = canonical_json_bytes(&summary);
+    let msg = sha2::Sha256::digest(&canon);
+    let sig_b64 = server_sign_fn.as_ref()(&msg);
+
+    let env = serde_json::json!({
+        "audit_summary_payload": summary,
+        "server_pubkey_b64": server_pubkey_b64_str,
+        "server_sig_b64": sig_b64
+    });
+
+    let path = audit_summary_path(date);
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&env).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(env)
+}
+
+async fn audit_summary(
+    axum::extract::Path(date): axum::extract::Path<String>
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    if date.len() != 10 || &date[4..5] != "-" || &date[7..8] != "-" {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into()));
+    }
+    // if exists, serve; else compute+sign+write
+    let path = audit_summary_path(&date);
+    if path.exists() {
+        let txt = std::fs::read_to_string(&path)
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok((axum::http::StatusCode::OK, txt));
+    }
+    let env = write_audit_summary(&date)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
@@ -1219,6 +1327,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ledger/final/:date", get(ledger_final))
         .route("/v1/audit/attest", post(audit_attest))
         .route("/v1/audit/log/:date", get(audit_log))
+        .route("/v1/audit/summary/:date", get(audit_summary))
         .route("/v1/tasks/pull", post(pull_task))
         .route("/v1/tasks/submit", post(submit_task))
         .with_state(state);
