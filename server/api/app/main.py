@@ -660,3 +660,67 @@ def device_attest(
     db.add(d)
     db.commit()
     return DeviceAttestResponse(accepted=True, note="ok")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+def compute_awarded_credits(manifest: dict, risk_score: float, antifarm_count: int) -> int:
+    """
+    Pricing model (MVP):
+      - base light/heavy
+      - heavy_work.kind + iters contribute linearly per 1M iters
+      - cap per instance
+      - risk penalty: multiplier = max(0, 1 - (risk/100)*penalty_per_100)
+      - anti-farm: if antifarm_count > threshold, multiplier decays linearly by decay_per_extra; floored by min_mult
+    """
+    base_light = _env_int("GMF_CREDITS_BASE_LIGHT", 1)
+    base_heavy = _env_int("GMF_CREDITS_BASE_HEAVY", 5)
+    cap = _env_int("GMF_CREDITS_MAX_PER_INSTANCE", 200)
+
+    pp = (manifest.get("power_profile") or "light").lower()
+    credits = base_heavy if pp == "heavy" else base_light
+
+    # Heavy add-on
+    if pp == "heavy":
+        hw = manifest.get("heavy_work") or {}
+        kind = (hw.get("kind") or "sha256_chain").lower()
+        iters = int(hw.get("iters") or 0)
+        per_1m = 0.0
+        if kind in ("sha256_chain", "sha256"):
+            per_1m = _env_float("GMF_CREDITS_RATE_SHA256_PER_1M", 1.0)
+        elif kind in ("poly_mod", "polymod"):
+            per_1m = _env_float("GMF_CREDITS_RATE_POLYMOD_PER_1M", 1.5)
+        else:
+            # unknown kind => conservative
+            per_1m = _env_float("GMF_CREDITS_RATE_SHA256_PER_1M", 1.0) * 0.5
+
+        credits += int(round((iters / 1_000_000.0) * per_1m))
+
+    # Risk penalty
+    pen = _env_float("GMF_RISK_CREDIT_PENALTY_PER_100", 0.5)  # risk=100 => multiply by (1-pen)
+    risk_mult = max(0.0, 1.0 - (max(0.0, risk_score) / 100.0) * pen)
+
+    # Anti-farm multiplier
+    window_sec = _env_int("GMF_ANTIFARM_WINDOW_SEC", 3600)
+    thr = _env_int("GMF_ANTIFARM_THRESHOLD", 50)
+    decay = _env_float("GMF_ANTIFARM_DECAY_PER_EXTRA", 0.01)
+    min_mult = _env_float("GMF_ANTIFARM_MIN_MULT", 0.2)
+
+    if antifarm_count > thr:
+        extra = antifarm_count - thr
+        farm_mult = max(min_mult, 1.0 - extra * decay)
+    else:
+        farm_mult = 1.0
+
+    final = int(math.floor(min(cap, max(0, credits)) * risk_mult * farm_mult))
+    return max(0, min(cap, final))
