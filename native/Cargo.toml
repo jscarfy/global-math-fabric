@@ -2,5 +2,6 @@
 resolver = "2"
 members = [
   "gmf_receipts",
-  "gmf_ledger"
+  "gmf_ledger",
+  "gmf_worker"
 ]

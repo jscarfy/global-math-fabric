@@ -1,0 +1,19 @@
+[package]
+name = "gmf_worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gmf_receipts = { path = "../gmf_receipts" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_json_canonicalizer = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+reqwest = { version = "0.12", features = ["json","rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+dirs = "5"
