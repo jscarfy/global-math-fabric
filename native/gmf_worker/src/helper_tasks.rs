@@ -30,6 +30,68 @@ async fn fetch_limited(url: &str) -> Result<Vec<u8>> {
 use reqwest::header::HeaderMap;
 use tokio::time::{timeout, Duration};
 
+
+use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Default)]
+struct HelperCursorEntry {
+    last_ts_unix_ms: i64,
+    // de-dup only for the CURRENT last_ts_unix_ms (same-millisecond duplicates)
+    seen_hashes_at_last_ts: Vec<String>
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Default)]
+struct HelperCursor {
+    // key: "{relay_base}|{date}|{kind}"
+    entries: HashMap<String, HelperCursorEntry>
+}
+
+fn default_cursor_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("GMF_HELPER_CURSOR_PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".gmf").join("helper_cursor.json")
+}
+
+fn load_cursor() -> HelperCursor {
+    let path = default_cursor_path();
+    if let Ok(txt) = std::fs::read_to_string(&path) {
+        if let Ok(v) = serde_json::from_str::<HelperCursor>(&txt) {
+            return v;
+        }
+    }
+    HelperCursor::default()
+}
+
+fn save_cursor(cur: &HelperCursor) -> Result<()> {
+    let path = default_cursor_path();
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(cur)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn line_hash_hex(line: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(line.as_bytes());
+    hex::encode(h.finalize())
+}
+
+// Robust ts extractor (must match relay behavior)
+fn extract_ts_unix_ms_from_ssr(v: &Value) -> i64 {
+    let p = v.get("receipt_payload");
+    if let Some(p) = p {
+        for k in ["server_time_unix_ms","issued_at_unix_ms","time_unix_ms","ts_unix_ms","server_time_ms","issued_at_ms","ts_ms"] {
+            if let Some(x) = p.get(k).and_then(|y| y.as_i64()) {
+                return x;
+            }
+        }
+    }
+    v.get("server_time_unix_ms").and_then(|y| y.as_i64()).unwrap_or(0)
+}
+
 const PAGE_MAX_LINES: usize = 5000; // must be <= relay cap
 const PAGE_TIMEOUT_SECS: u64 = 30;
 
@@ -68,6 +130,41 @@ async fn fetch_snapshot_json(relay_base: &str, date: &str) -> Result<serde_json:
     if !resp.status().is_success() {
         return Err(anyhow!("snapshot fetch failed: {}", resp.status()));
     }
+
+
+async fn fetch_delta_once(relay_base: &str, date: &str, since_unix_ms: i64, max_lines: usize) -> Result<(String, i64, bool)> {
+    // returns: (jsonl_text, last_ts_header, may_have_more)
+    let url = format!(
+        "{}/v1/ledger/ssr_delta/{}?since_unix_ms={}&max_lines={}",
+        relay_base.trim_end_matches('/'),
+        date,
+        since_unix_ms,
+        max_lines.min(50_000).max(1)
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PAGE_TIMEOUT_SECS))
+        .build()?;
+
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("ssr_delta fetch failed: {}", resp.status()));
+    }
+    let headers = resp.headers().clone();
+    let last_ts: i64 = headers
+        .get("X-GMF-LAST-TS-UNIX-MS")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(since_unix_ms);
+
+    let may_have_more = headers
+        .get("X-GMF-MAY-HAVE-MORE")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("0") == "1";
+
+    let txt = resp.text().await?;
+    Ok((txt, last_ts, may_have_more))
+}
     let txt = resp.text().await?;
     Ok(serde_json::from_str(&txt)?)
 }
