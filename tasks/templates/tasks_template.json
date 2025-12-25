@@ -1,23 +1,32 @@
 {
-  "version": 1,
+  "version": 2,
   "defaults": {
     "protocol": "gmf/task/v1",
     "replicas": 2,
     "credit_micro_total": 2000000
   },
+  "matrix": {
+    "name": ["mathlib_demo"],
+    "git_url": ["https://github.com/leanprover-community/mathlib4.git"],
+    "rev": ["master"],
+    "subdir": [""],
+    "target_file": ["Mathlib/Algebra/Group/Basic.lean"]
+  },
   "tasks": [
     {
-      "task_id": "leancheck_mathlib_demo_001",
+      "task_id": "lean_${name}_${target_file}",
       "kind": "lean_check",
       "credit_micro_total": 3000000,
       "replicas": 2,
       "params": {
-        "git_url": "https://github.com/leanprover-community/mathlib4.git",
-        "rev": "master",
-        "subdir": "",
-        "cmd": ["lake", "build"],
-        "use_mathlib_cache": true,
+        "git_url": "${git_url}",
+        "rev": "${rev}",
+        "subdir": "${subdir}",
 
+        "cmd": ["lake","env","lean","${target_file}"],
+        "target_file": "${target_file}",
+
+        "use_mathlib_cache": true,
         "artifacts_root": ".lake/build/lib",
         "require_artifact_hash": true,
 
