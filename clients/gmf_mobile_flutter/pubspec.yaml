@@ -88,3 +88,16 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+dependencies:
+  http: ^1.2.2
+  cryptography: ^2.7.0
+  flutter_secure_storage: ^9.2.2
+  uuid: ^4.5.1
+  shared_preferences: ^2.3.2
+
+dev_dependencies:
+  flutter_lints: ^5.0.0
+
+# Background tasks
+dependency_overrides:
