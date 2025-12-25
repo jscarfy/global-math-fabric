@@ -7,20 +7,18 @@ OUT = Path("tasks/pool/tasks.jsonl")
 
 VAR_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 
-def jcs_like(obj):
-    # simple stable JSON for hashing (close enough for work_unit_id)
+def stable_json(obj):
     return json.dumps(obj, sort_keys=True, separators=(",",":"))
 
 def sha256_hex(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 def sanitize_task_id(s: str) -> str:
-    # make it filesystem + git-friendly
     s = s.replace(" ", "_")
     s = s.replace("/", "_").replace("\\", "_").replace(".", "_").replace(":", "_")
     s = re.sub(r"[^A-Za-z0-9_\-]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
-    return s[:160] if len(s) > 160 else s
+    return s[:180] if len(s) > 180 else s
 
 def subst_str(s: str, env: dict) -> str:
     def rep(m):
@@ -39,34 +37,25 @@ def subst_any(x, env: dict):
         return {k: subst_any(v, env) for k, v in x.items()}
     return x
 
-def compute_work_unit_id(task: dict) -> str:
-    # anti-dup key: kind + essential params that define the work
-    kind = task.get("kind","")
-    params = task.get("params") or {}
+def compute_work_unit_id(kind: str, params: dict) -> str:
     unit = {
         "kind": kind,
         "git_url": params.get("git_url",""),
         "rev": params.get("rev",""),
         "subdir": params.get("subdir",""),
         "cmd": params.get("cmd",[]),
-        "target_file": params.get("target_file",""),
         "docker_image": params.get("docker_image",""),
         "artifacts_root": params.get("artifacts_root","")
     }
-    return sha256_hex(jcs_like(unit).encode("utf-8"))
+    return sha256_hex(stable_json(unit).encode("utf-8"))
 
-def main():
-    data = json.loads(TEMPLATE.read_text())
-    version = data.get("version", 1)
-    defaults = data.get("defaults", {})
-    tasks_tpl = data.get("tasks", [])
-    matrix = data.get("matrix", {}) if version >= 2 else {}
-
-    if not isinstance(tasks_tpl, list) or not tasks_tpl:
-        raise SystemExit("template.tasks must be a non-empty list")
-
-    # Build env combinations
-    if version >= 2 and matrix:
+def load_matrix_envs(data: dict):
+    version = int(data.get("version", 1))
+    if version < 3:
+        # v1/v2: only cartesian matrix or empty env
+        matrix = data.get("matrix", {}) or {}
+        if not matrix:
+            return [dict()]
         keys = list(matrix.keys())
         vals = []
         for k in keys:
@@ -74,18 +63,56 @@ def main():
             if not isinstance(v, list) or not v:
                 raise SystemExit(f"matrix.{k} must be non-empty list")
             vals.append(v)
-        combos = [dict(zip(keys, prod)) for prod in itertools.product(*vals)]
-    else:
-        combos = [dict()]
+        return [dict(zip(keys, prod)) for prod in itertools.product(*vals)]
+
+    # v3: prefer matrix_rows_file
+    mrf = data.get("matrix_rows_file")
+    if mrf:
+        p = Path(mrf)
+        if p.exists():
+            rows = json.loads(p.read_text())
+            if not isinstance(rows, list) or not rows:
+                raise SystemExit("matrix_rows_file must contain a non-empty JSON list")
+            # normalize: ensure shard_id exists
+            envs = []
+            for i, r in enumerate(rows):
+                if not isinstance(r, dict):
+                    raise SystemExit("matrix_rows_file rows must be objects")
+                rr = dict(r)
+                rr.setdefault("shard_id", f"{i:06d}")
+                rr.setdefault("name", "auto")
+                envs.append(rr)
+            return envs
+
+    # fallback cartesian
+    matrix = data.get("matrix", {}) or {}
+    if not matrix:
+        return [dict()]
+    keys = list(matrix.keys())
+    vals = []
+    for k in keys:
+        v = matrix[k]
+        if not isinstance(v, list) or not v:
+            raise SystemExit(f"matrix.{k} must be non-empty list")
+        vals.append(v)
+    return [dict(zip(keys, prod)) for prod in itertools.product(*vals)]
+
+def main():
+    data = json.loads(TEMPLATE.read_text())
+    defaults = data.get("defaults", {})
+    tasks_tpl = data.get("tasks", [])
+    if not isinstance(tasks_tpl, list) or not tasks_tpl:
+        raise SystemExit("template.tasks must be a non-empty list")
+
+    envs = load_matrix_envs(data)
 
     lines = []
     seen_task_id = set()
     seen_unit = set()
 
-    for env in combos:
+    for env in envs:
         for t in tasks_tpl:
             task = subst_any(t, env)
-
             obj = dict(defaults)
             obj.update(task)
 
@@ -110,14 +137,13 @@ def main():
                 if "@sha256:" not in params["docker_image"]:
                     raise SystemExit(f"lean_check {tid} docker_image must be digest pinned (@sha256:...)")
 
-                # compute work_unit_id
-                unit_id = compute_work_unit_id({"kind": kind, "params": params})
+                unit_id = compute_work_unit_id(kind, params)
                 params["work_unit_id"] = unit_id
                 obj["params"] = params
 
                 allow_dup = bool(params.get("allow_duplicate_work_unit", False))
                 if not allow_dup and unit_id in seen_unit:
-                    raise SystemExit(f"duplicate work_unit_id detected (anti-dup): {unit_id}  (task_id={tid})")
+                    raise SystemExit(f"duplicate work_unit_id detected (anti-dup): {unit_id} (task_id={tid})")
                 seen_unit.add(unit_id)
 
             if tid in seen_task_id:
