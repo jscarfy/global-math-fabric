@@ -24,3 +24,5 @@ yarn-error.log*
 
 # Docker
 *.log
+governance/vault/
+keys/*.priv.pem

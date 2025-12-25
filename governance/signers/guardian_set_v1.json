@@ -1,0 +1,9 @@
+{
+  "guardian_set_id": "guardian_set_v1",
+  "threshold": 2,
+  "signers": [
+    {"id": "guardian-1", "pub_pem": "governance/signers/guardian-1.ed25519.pub.pem"},
+    {"id": "guardian-2", "pub_pem": "governance/signers/guardian-2.ed25519.pub.pem"},
+    {"id": "guardian-3", "pub_pem": "governance/signers/guardian-3.ed25519.pub.pem"}
+  ]
+}
