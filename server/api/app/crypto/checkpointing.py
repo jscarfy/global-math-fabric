@@ -1,3 +1,4 @@
+from app.crypto.merkle_cache import MerkleCache
 import os, json, base64
 from datetime import datetime, timezone
 from typing import Any, Dict, Tuple, List
@@ -25,9 +26,15 @@ def leaf_hashes_from_ledger_lines(lines: List[bytes]) -> List[bytes]:
 
 def current_ledger_root_and_len() -> Tuple[str, int]:
     lines = read_all_lines()
-    hs = leaf_hashes_from_ledger_lines(lines)
-    root = merkle_root_from_leaf_hashes(hs).hex()
-    return root, len(lines)
+    n = len(lines)
+    if n <= 0:
+        return ("00"*32), 0
+    # ensure leaves exist (best-effort); internal nodes are lazy
+    mc = _mc()
+    for i, b in enumerate(lines):
+        if mc.get(0, i) is None:
+            mc.ensure_leaf_hash(i, b)
+    return mc.root_for_n(n), n
 
 def guardian_set() -> Dict[str, Any]:
     gset_path = os.environ.get("GMF_GUARDIAN_SET_PATH", "governance/signers/guardian_set_v1.json")
@@ -115,8 +122,11 @@ def accept_checkpoint(checkpoint: Dict[str, Any], rules_sha256_expected: str) ->
     lines = read_all_lines()
     if n > len(lines):
         raise ValueError("checkpoint entries exceed current ledger length")
-    hs = leaf_hashes_from_ledger_lines(lines[:n])
-    recomputed = merkle_root_from_leaf_hashes(hs).hex()
+    mc = _mc()
+    for i, b in enumerate(lines[:n]):
+        if mc.get(0, i) is None:
+            mc.ensure_leaf_hash(i, b)
+    recomputed = mc.root_for_n(n)
     if recomputed != root:
         raise ValueError("checkpoint root not matching current ledger prefix")
 
@@ -139,3 +149,8 @@ def latest_checkpoint() -> Dict[str, Any] | None:
     path = os.path.join(checkpoints_dir(), cps[-1])
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _mc() -> MerkleCache:
+    dbp = os.environ.get("GMF_MERKLE_DB", "ledger/cache/merkle_nodes.sqlite")
+    return MerkleCache(dbp)

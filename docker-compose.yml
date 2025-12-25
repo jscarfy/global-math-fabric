@@ -72,6 +72,7 @@ volumes:
       - GMF_RULES_SIGSET_PATH=governance/rules/v1.sigset.json
       - GMF_GUARDIAN_SET_PATH=governance/signers/guardian_set_v1.json
       - GMF_LEDGER_JSONL=ledger/receipts/receipts.jsonl
+      - GMF_MERKLE_DB=ledger/cache/merkle_nodes.sqlite
       - GMF_LEDGER_CHECKPOINTS_DIR=ledger/checkpoints
       - GMF_LEDGER_PENDING_DIR=ledger/pending_checkpoints
       - GMF_CREDITS_BASE_HEAVY=5
