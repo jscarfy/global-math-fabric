@@ -18,6 +18,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 
     // expose server signing closure for final snapshot signing (msg is SHA256(payload_canon))
     let server_pubkey_b64_str = {
+
+    let _ = write_identity_pubkey_once(&server_pubkey_b64_str);
         // reuse whatever you already put into SSR for server_pubkey_b64 if available
         // fallback: keep empty and patch manually if needed
         String::new()
@@ -201,6 +203,16 @@ fn write_snapshot(date: &str) -> Result<serde_json::Value, String> {
     std::fs::write(&tmp, serde_json::to_vec_pretty(&snap).unwrap()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     Ok(snap)
+}
+
+
+fn write_identity_pubkey_once(server_pubkey_b64: &str) -> Result<(), String> {
+    let dir = PathBuf::from("ledger/identity");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("server_pubkey_b64.txt");
+    if path.exists() { return Ok(()); }
+    std::fs::write(&path, format!("{}\n", server_pubkey_b64)).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 struct AppState {
