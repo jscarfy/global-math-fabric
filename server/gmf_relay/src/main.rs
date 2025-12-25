@@ -1417,6 +1417,11 @@ fn build_report_payload(kind: &str, period_id: &str, dates: Vec<String>) -> Resu
     let mut audits = vec![];
     let mut metas = vec![];
 
+    let mut sum_main_credits: i64 = 0;
+    let mut sum_audit_points: i64 = 0;
+    let mut main_known = true;
+    let mut audit_known = true;
+
     for d in dates {
         if !is_date_triple_ok(&d) { excluded.push(d); continue; }
         let f = load_json_file(&final_snapshot_path(&d))?;
@@ -1428,6 +1433,10 @@ fn build_report_payload(kind: &str, period_id: &str, dates: Vec<String>) -> Resu
         let ml = m.get("meta_audit_final_payload").and_then(|p| p.get("meta_audit_log_sha256")).and_then(|v| v.as_str()).ok_or("bad meta_audit_final")?;
 
         included.push(d);
+        let (m_tot, a_tot) = read_canonical_totals(included.last().unwrap());
+        if let Some(x) = m_tot { sum_main_credits += x; } else { main_known = false; }
+        if let Some(x) = a_tot { sum_audit_points += x; } else { audit_known = false; }
+
         finals.push(serde_json::Value::String(fs.to_string()));
         audits.push(serde_json::Value::String(al.to_string()));
         metas.push(serde_json::Value::String(ml.to_string()));
@@ -1452,8 +1461,8 @@ fn build_report_payload(kind: &str, period_id: &str, dates: Vec<String>) -> Resu
         "excluded_dates": excluded,
         "aggregates": {
             "days_count": roll_src.get("included_dates").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
-            "sum_main_credits_micro": serde_json::Value::Null,
-            "sum_audit_points_micro": serde_json::Value::Null
+            "sum_main_credits_micro": if main_known { serde_json::Value::Number(sum_main_credits.into()) } else { serde_json::Value::Null },
+            "sum_audit_points_micro": if audit_known { serde_json::Value::Number(sum_audit_points.into()) } else { serde_json::Value::Null }
         },
         "bindings": bindings,
         "merkle_or_rollup": {
@@ -1528,6 +1537,18 @@ async fn yearly_report_finalize(
     let env = write_report_once(&yearly_report_path(&y), "yearly_final_payload", payload)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
+}
+
+
+fn read_canonical_totals(date: &str) -> (Option<i64>, Option<i64>) {
+    // returns (main_credits_total_micro, audit_points_total_micro)
+    let p = PathBuf::from("releases/settlement").join(date).join("canonical_totals.json");
+    if !p.exists() { return (None, None); }
+    let txt = match std::fs::read_to_string(&p) { Ok(t) => t, Err(_) => return (None, None) };
+    let v: serde_json::Value = match serde_json::from_str(&txt) { Ok(x) => x, Err(_) => return (None, None) };
+    let main = v.get("main_credits_total_micro").and_then(|x| x.as_i64());
+    let audit = v.get("audit_points_total_micro").and_then(|x| x.as_i64());
+    (main, audit)
 }
 
 async fn health() -> &'static str { "ok" }
