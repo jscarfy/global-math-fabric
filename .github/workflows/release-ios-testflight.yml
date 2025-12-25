@@ -1,0 +1,97 @@
+name: release-ios-testflight
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: false
+
+      - name: Patch Flutter version from tag (x.y.z+run_number)
+        run: |
+          ./scripts/release/patch_flutter_version_from_tag.sh "${GITHUB_REF_NAME}" "${GITHUB_RUN_NUMBER}" clients/gmf_mobile_flutter/pubspec.yaml
+
+      - name: Import iOS signing cert (.p12) into keychain
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.IOS_DIST_P12_B64 }}
+          p12-password: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+
+      - name: Install provisioning profile
+        env:
+          IOS_MOBILEPROVISION_B64: ${{ secrets.IOS_MOBILEPROVISION_B64 }}
+        run: |
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$IOS_MOBILEPROVISION_B64" | base64 -d > "$HOME/Library/MobileDevice/Provisioning Profiles/gmf.mobileprovision"
+
+      - name: Generate exportOptions.plist (app-store)
+        env:
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          IOS_PROFILE_NAME: ${{ secrets.IOS_PROFILE_NAME }}
+        run: |
+          cat > clients/gmf_mobile_flutter/ios/exportOptions.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>method</key><string>app-store</string>
+  <key>teamID</key><string>${IOS_TEAM_ID}</string>
+  <key>signingStyle</key><string>manual</string>
+  <key>provisioningProfiles</key>
+  <dict>
+    <key>${IOS_BUNDLE_ID}</key><string>${IOS_PROFILE_NAME}</string>
+  </dict>
+</dict>
+</plist>
+EOF
+
+      - name: Build IPA (Flutter)
+        run: |
+          cd clients/gmf_mobile_flutter
+          flutter pub get
+          flutter build ipa --release --export-options-plist=ios/exportOptions.plist
+          ls -lh build/ios/ipa/*.ipa
+
+      - name: Prepare App Store Connect API key files
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_P8_B64: ${{ secrets.ASC_P8_B64 }}
+        run: |
+          mkdir -p /tmp/asc
+          echo "$ASC_P8_B64" | base64 -d > /tmp/asc/AuthKey.p8
+          cat > /tmp/asc/api_key.json <<EOF
+{
+  "key_id": "${ASC_KEY_ID}",
+  "issuer_id": "${ASC_ISSUER_ID}",
+  "key_filepath": "/tmp/asc/AuthKey.p8"
+}
+EOF
+          chmod 600 /tmp/asc/AuthKey.p8 /tmp/asc/api_key.json
+
+      - name: Upload to TestFlight (fastlane pilot/upload_to_testflight)
+        env:
+          ASC_API_KEY_JSON: /tmp/asc/api_key.json
+        run: |
+          IPA_PATH="$(ls -1 clients/gmf_mobile_flutter/build/ios/ipa/*.ipa | head -n 1)"
+          echo "IPA_PATH=$IPA_PATH"
+          cd clients/gmf_mobile_flutter/ios
+          bundle install --path vendor/bundle
+          export IPA_PATH
+          bundle exec fastlane ios testflight
