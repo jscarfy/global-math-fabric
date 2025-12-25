@@ -30,6 +30,24 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: 'stable'
+      - name: Patch msix_version from tag
+        shell: bash
+        run: |
+          cd clients/gmf_mobile_flutter
+          python3 - <<'P'
+from pathlib import Path
+import re, os
+msix=os.environ.get('MSIX_VERSION','0.0.0.0')
+p=Path('pubspec.yaml')
+s=p.read_text()
+if re.search(r'^\s*msix_version\s*:', s, flags=re.M):
+    s=re.sub(r'^\s*msix_version\s*:.*$', f'  msix_version: {msix}', s, flags=re.M)
+else:
+    s=re.sub(r'(msix_config:\s*\n)', r"\1  msix_version: %s\n"%msix, s, count=1)
+p.write_text(s)
+print('msix_version set ->', msix)
+P
+
       - run: |
           cd clients/gmf_mobile_flutter
           flutter pub get
