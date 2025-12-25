@@ -865,6 +865,9 @@ async fn ledger_ssr_delta(
     headers.insert("Content-Type", axum::http::HeaderValue::from_static("application/jsonl"));
     headers.insert("X-GMF-KEPT-LINES", axum::http::HeaderValue::from_str(&kept.to_string()).unwrap());
     headers.insert("X-GMF-LAST-TS-UNIX-MS", axum::http::HeaderValue::from_str(&last_ts.to_string()).unwrap());
+
+    let may_have_more = if kept >= max_lines { "1" } else { "0" };
+    headers.insert("X-GMF-MAY-HAVE-MORE", axum::http::HeaderValue::from_str(may_have_more).unwrap());
     Ok((axum::http::StatusCode::OK, headers, out))
 }
 
