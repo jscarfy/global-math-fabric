@@ -47,6 +47,14 @@ def require_client(db: Session, x_api_key: str | None) -> Client:
         raise HTTPException(status_code=401, detail="invalid_api_key")
     return c
 
+def require_verifier(x_verifier_key: str | None):
+    expected = os.environ.get("GMF_VERIFIER_SHARED_KEY", "")
+    if not expected:
+        raise HTTPException(status_code=500, detail="verifier_key_not_configured")
+    if not x_verifier_key or x_verifier_key != expected:
+        raise HTTPException(status_code=401, detail="unauthorized_verifier")
+
+
 def award(db: Session, client: Client, kind: str, points: int, meta: dict):
     ev = CreditEvent(client_id_fk=client.id, kind=kind, points=points, meta=meta)
     client.credits_total = (client.credits_total or 0) + points
@@ -354,11 +362,12 @@ def receipts_for_instance(
 
 
 @app.get("/replay/queue", response_model=ReplayQueueResponse)
-def replay_queue(limit: int = 200, db: Session = Depends(get_db)):
+def replay_queue(limit: int = 200, x_verifier_key: str | None = Header(default=None, alias="X-Verifier-Key"), db: Session = Depends(get_db)):
     """
     Returns ONE verified instance that has not yet been replay-checked.
-    MVP: no auth; in production restrict to verifier keys.
+    Auth: requires X-Verifier-Key.
     """
+    require_verifier(x_verifier_key)
     # find a verified instance without replay_checks
     inst = (
         db.query(TaskInstance)
@@ -400,7 +409,7 @@ def replay_queue(limit: int = 200, db: Session = Depends(get_db)):
     return ReplayQueueResponse(item=None, note="no_item")
 
 @app.post("/replay/report", response_model=ReplayReportResponse)
-def replay_report(req: ReplayReportRequest, db: Session = Depends(get_db)):
+def replay_report(req: ReplayReportRequest, x_verifier_key: str | None = Header(default=None, alias="X-Verifier-Key"), db: Session = Depends(get_db)):
     inst = db.query(TaskInstance).filter(TaskInstance.id == req.instance_id).first()
     if not inst:
         return ReplayReportResponse(accepted=False, note="instance_not_found")
@@ -411,9 +420,30 @@ def replay_report(req: ReplayReportRequest, db: Session = Depends(get_db)):
     db.add(ReplayCheck(instance_id_fk=inst.id, ok=req.ok, verifier_id=req.verifier_id, meta=req.detail))
     db.commit()
 
-    # MVP: if mismatch, mark disputed
+    # If mismatch, mark disputed + clawback
     if not req.ok:
         inst.status = "disputed"
         db.add(inst)
+        db.commit()
+
+        # Claw back credits previously issued for this instance (MVP: based on receipts)
+        recs = db.query(Receipt).filter(Receipt.instance_id_fk == inst.id).all()
+        for r in recs:
+            wc = db.query(Client).filter(Client.client_id == r.issued_to_client_id).first()
+            if wc:
+                # negative credit event
+                db.add(CreditEvent(client_id=wc.id, kind="replay_clawback", delta=-int(r.credits_delta), meta={"instance_id": str(inst.id)}))
+                wc.credits_total = int(wc.credits_total) - int(r.credits_delta)
+                db.add(wc)
+                # signed clawback receipt
+                body = {
+                    "kind": "replay_clawback",
+                    "instance_id": str(inst.id),
+                    "points": -int(r.credits_delta),
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                    "client_id": r.issued_to_client_id,
+                }
+                rk, sigb64 = sign_receipt(body)
+                db.add(Receipt(instance_id_fk=inst.id, issued_to_client_id=r.issued_to_client_id, credits_delta=-int(r.credits_delta), body=body, sig_key_id=rk, signature_b64=sigb64))
         db.commit()
     return ReplayReportResponse(accepted=True, note="ok")

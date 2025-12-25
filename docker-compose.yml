@@ -36,10 +36,30 @@ volumes:
 
 
   verifier:
-    build:
-      context: ./verifier
     environment:
       - GMF_API=http://api:8000
       - GMF_VERIFIER_ID=verifier-1
+      - GMF_VERIFIER_SHARED_KEY=dev-verifier-key
+      - GMF_REPLAY_MIN_VERIFIERS=2
+      - GMF_REPLAY_MISMATCH_MIN=2
+      - GMF_REPLAY_SAMPLE_PCT=5
+      - GMF_REPLAY_SAMPLE_PCT_RISK=50
+    build:
+      context: .
+      dockerfile: verifier-rs/Dockerfile
+    environment:
+      - GMF_API=http://api:8000
+      - GMF_VERIFIER_ID=verifier-1
+    depends_on:
+      - api
+
+  verifier2:
+    build:
+      context: .
+      dockerfile: verifier-rs/Dockerfile
+    environment:
+      - GMF_API=http://api:8000
+      - GMF_VERIFIER_ID=verifier-2
+      - GMF_VERIFIER_SHARED_KEY=dev-verifier-key
     depends_on:
       - api
