@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'gmf/android_notification_permission.dart';
 import 'gmf/tray.dart';
 import 'gmf/consent_store.dart';
 import 'gmf/consent_screen.dart';
@@ -49,6 +50,8 @@ void callbackDispatcher() {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  try { await AndroidNotificationPermission.ensure(); } catch (_) {}
+
   // desktop tray visibility (best-effort)
   try { await GMFTray.init(); } catch (_) {}
 
