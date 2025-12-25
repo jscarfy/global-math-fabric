@@ -129,3 +129,15 @@ volumes:
       - "8091:8090"
 
 # GMF_POLICY_PATH/GMF_POLICY_HASH envs could not be auto-placed; add under api:environment manually.
+
+  gmf_cron:
+    build:
+      context: .
+      dockerfile: server/cron/Dockerfile
+    volumes:
+      - ./:/repo
+    environment:
+      - GH_TOKEN=${GH_TOKEN-}
+      - RUN_HOUR=0
+      - RUN_MIN=10
+    restart: unless-stopped
