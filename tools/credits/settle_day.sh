@@ -24,4 +24,12 @@ curl -fsS "${RELAY}/v1/ledger/final/${DATE}" > "ledger/snapshots/${DATE}.final.j
 # 3) export from final
 ./tools/credits/export_from_final.py "${DATE}"
 
+
+
+# 4) fetch audit summary (best-effort) and export audit points
+mkdir -p ledger/audit
+curl -fsS "${RELAY}/v1/audit/summary/${DATE}" > "ledger/audit/${DATE}.audit_summary.json" || true
+
+./tools/audit/export_audit_points.py "${DATE}"
+
 echo "OK: settled ${DATE} using immutable final snapshot anchor."
