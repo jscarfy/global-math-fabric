@@ -22,6 +22,10 @@ mkdir -p ledger/snapshots
 curl -fsS "${RELAY}/v1/ledger/final/${DATE}" > "ledger/snapshots/${DATE}.final.json"
 
 # 3) export from final
+
+# 3.5) HARD GATE: triple-anchor must exist+verify before any canonical export
+./tools/settlement/verify_triple_anchor.sh "${DATE}"
+
 ./tools/credits/export_from_final.py "${DATE}"
 
 
