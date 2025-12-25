@@ -1,10 +1,13 @@
 import 'dart:convert';
 import 'package:crypto/crypto.dart' as c;
 import 'package:cryptography/cryptography.dart';
+import 'package:jcs_dart/jcs_dart.dart';
 
-String sha256HexBytes(List<int> bytes) {
-  final h = c.sha256.convert(bytes).bytes;
-  return h.map((b)=>b.toRadixString(16).padLeft(2,'0')).join();
+List<int> _sha256(List<int> bytes) => c.sha256.convert(bytes).bytes;
+
+List<int> jcsBytes(Map<String, dynamic> obj) {
+  final canon = JsonCanonicalizer().canonicalize(jsonEncode(obj));
+  return utf8.encode(canon);
 }
 
 Future<String> signClaimPayloadB64({
@@ -14,27 +17,10 @@ Future<String> signClaimPayloadB64({
   final ed = Ed25519();
   final seed = base64Decode(devicePrivSeedB64);
   final keyPair = await ed.newKeyPairFromSeed(seed);
-  final payloadBytes = utf8.encode(jsonEncode(_canonicalizeJson(claimPayload)));
-  final msg = c.sha256.convert(payloadBytes).bytes;
+
+  final msg = _sha256(jcsBytes(claimPayload));
   final sig = await ed.sign(msg, keyPair: keyPair);
   return base64Encode(sig.bytes);
-}
-
-// Minimal “canonicalization” for MVP: stable JSON encoding with sorted keys.
-// Later你可以替換成 RFC8785(JCS) 的 Dart 實作，對齊 Rust/JCS 完全一致。
-dynamic _canonicalizeJson(dynamic v) {
-  if (v is Map) {
-    final keys = v.keys.map((k)=>k.toString()).toList()..sort();
-    final m = <String,dynamic>{};
-    for (final k in keys) {
-      m[k]=_canonicalizeJson(v[k]);
-    }
-    return m;
-  } else if (v is List) {
-    return v.map(_canonicalizeJson).toList();
-  } else {
-    return v;
-  }
 }
 
 Map<String, dynamic> makeClaimPayload({
@@ -43,10 +29,11 @@ Map<String, dynamic> makeClaimPayload({
   required int gpuMs,
   required List<Map<String,dynamic>> artifacts,
 }) {
+  final now = DateTime.now().toUtc().toIso8601String();
   return {
     "task_id": taskId,
-    "started_at": DateTime.now().toUtc().toIso8601String(),
-    "ended_at": DateTime.now().toUtc().toIso8601String(),
+    "started_at": now,
+    "ended_at": now,
     "metrics": {
       "cpu_ms": cpuMs,
       "gpu_ms": gpuMs,
