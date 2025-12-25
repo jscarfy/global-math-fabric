@@ -395,3 +395,14 @@ fn compute_heavy_work_proof(instance_id: &str, stdout_sha256: &str, spec: &Heavy
         }
     }
 }
+
+
+static LAST_RECEIPT_JSON: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
+pub fn set_last_receipt_json(s: String) {
+    *LAST_RECEIPT_JSON.lock() = Some(s);
+}
+
+pub fn take_last_receipt_json() -> Option<String> {
+    LAST_RECEIPT_JSON.lock().take()
+}

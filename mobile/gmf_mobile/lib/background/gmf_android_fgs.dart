@@ -7,6 +7,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../capabilities/gmf_capabilities.dart';
 import '../capabilities/gmf_heartbeat.dart';
 import '../ffi/gmf_worker.dart';
+import '../ffi/gmf_receipt_ffi.dart';
+import '../receipts/gmf_receipts_store.dart';
 import 'gmf_android_permissions.dart';
 import 'gmf_interval_policy.dart';
 import 'gmf_server_status.dart';
@@ -33,6 +35,14 @@ Future<bool> gmfRunOneIteration() async {
 
   final worker = GmfWorkerFFI(GmfWorkerFFI.openNative());
   final ok = worker.runOnce(apiBase, apiKey);
+  // grab receipt emitted by server report() and persist locally
+  try {
+    final rffi = GmfReceiptFFI(GmfReceiptFFI.openNative());
+    final r = rffi.takeReceiptJson();
+    if (r != null && r.isNotEmpty) {
+      await GmfReceiptsStore.appendJsonLine(r);
+    }
+  } catch (_) {}
   return ok;
 }
 

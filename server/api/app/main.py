@@ -21,6 +21,8 @@ from app.schemas.credits import MeResponse, LeaderboardResponse, LeaderboardRow
 from app.schemas.receipt import ReceiptsResponse, ReceiptRow
 from app.schemas.device import DeviceRegisterRequest, DeviceRegisterResponse, DeviceChallengeResponse, HeartbeatRequest, HeartbeatResponse
 from app.schemas.attest import DeviceAttestRequest, DeviceAttestResponse
+from app.crypto.receipt import sign_receipt, now_iso
+from app.schemas.receipt import ReceiptEnvelope
 from app.schemas.replay import ReplayQueueResponse, ReplayQueueItem, ReplayReportRequest, ReplayReportResponse
 from app.security.signing import load_truststore, verify_bundle_ed25519
 from app.security.receipt_signing import sign_receipt
@@ -348,6 +350,25 @@ def report_instance(
         # audit failures other than explicit mismatch should not break normal flow in MVP
         pass
     # ----------------------------------------
+
+    
+    # --- issue receipt (offline verifiable) ---
+    receipt_payload = {
+        "v": 1,
+        "issued_at": now_iso(),
+        "client_id": str(c.id),
+        "device_id": str(getattr(inst, "leased_device_id_fk", "") or getattr(inst, "device_id_fk", "") or ""),
+        "task_id": str(getattr(inst, "task_id_fk", "")),
+        "instance_id": str(req.instance_id),
+        "awarded_credits": int(getattr(inst, "credits_awarded", 0) or 0),
+        "risk_score": float(getattr(c, "risk_score", 0.0) or 0.0),
+        "stdout_sha256": str(req.stdout_sha256),
+        # optional proof summary (client/server already computed)
+        "work_proof": (req.stdout_json or {}).get("_work_proof", None),
+    }
+    key_id, sig_b64, payload_b64 = sign_receipt(receipt_payload)
+    receipt_env = ReceiptEnvelope(key_id=key_id, payload_b64=payload_b64, signature_b64=sig_b64)
+    # -----------------------------------------
 
     return ReportResponse(accepted=False, verified_now=False, note="bad_lease_token")
     if inst.leased_by != client.client_id:
