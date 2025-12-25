@@ -1,0 +1,2 @@
+# Put your Play internal testing link here (one line), e.g.
+# https://play.google.com/apps/testing/your.package.name
