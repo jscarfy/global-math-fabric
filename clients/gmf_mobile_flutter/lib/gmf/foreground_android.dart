@@ -2,6 +2,17 @@ import 'dart:io';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 class GMFForegroundAndroid {
+  static Future<void> update(String title, String text) async {
+    if (!Platform.isAndroid) return;
+    if (!await FlutterForegroundTask.isRunningService) return;
+    try {
+      await FlutterForegroundTask.updateService(
+        notificationTitle: title,
+        notificationText: text,
+      );
+    } catch (_) {}
+  }
+
   static Future<void> init() async {
     if (!Platform.isAndroid) return;
     await FlutterForegroundTask.init(
