@@ -26,67 +26,62 @@ async fn fetch_limited(url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-fn jcs_canonicalize(v: &Value) -> Vec<u8> {
-    // small canonicalizer: serde_json with sorted keys recursively
-    fn sort(v: &Value) -> Value {
-        match v {
-            Value::Object(map) => {
-                let mut keys: Vec<_> = map.keys().cloned().collect();
-                keys.sort();
-                let mut out = serde_json::Map::new();
-                for k in keys {
-                    out.insert(k.clone(), sort(&map[&k]));
-                }
-                Value::Object(out)
-            }
-            Value::Array(a) => Value::Array(a.iter().map(sort).collect()),
-            _ => v.clone()
-        }
-    }
-    serde_json::to_vec(&sort(v)).unwrap()
-}
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    hex::encode(h.finalize())
-}
+use reqwest::header::HeaderMap;
+use tokio::time::{timeout, Duration};
 
-fn verify_ssr_line(line: &str) -> Result<bool> {
-    let ssr: Value = serde_json::from_str(line)?;
-    let payload = ssr.get("receipt_payload").ok_or_else(|| anyhow!("missing receipt_payload"))?;
-    let server_pubkey_b64 = ssr.get("server_pubkey_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_pubkey_b64"))?;
-    let server_sig_b64 = ssr.get("server_sig_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_sig_b64"))?;
+const PAGE_MAX_LINES: usize = 5000; // must be <= relay cap
+const PAGE_TIMEOUT_SECS: u64 = 30;
 
-    let pk_bytes = B64.decode(server_pubkey_b64)?;
-    let pk = VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| anyhow!("bad pk bytes"))?)
-        .map_err(|_| anyhow!("bad pk"))?;
-
-    let sig_bytes = B64.decode(server_sig_b64)?;
-    let sig = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| anyhow!("bad sig bytes"))?);
-
-    let canon = jcs_canonicalize(payload);
-    let msg = Sha256::digest(&canon);
-    Ok(pk.verify(&msg, &sig).is_ok())
-}
-
-pub async fn run_receipt_verify(relay_base: &str, params: &Value) -> Result<Value> {
-    let date = params.get("date").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing params.date"))?;
-    let endpoint = params.get("ledger_endpoint").and_then(|v| v.as_str())
+async fn fetch_ledger_chunk(relay_base: &str, endpoint: &str, offset_lines: usize, max_lines: usize) -> Result<(Vec<u8>, bool, usize)> {
+    // returns: (raw_bytes, eof, next_offset)
+    let url_endpoint = params.get("ledger_endpoint").and_then(|v| v.as_str())
         .unwrap_or(&format!("/v1/ledger/ssr/{date}"));
-    let url = format!("{}{}", relay_base.trim_end_matches('/'), endpoint);
 
-    let bytes = fetch_limited(&url).await?;
-    let digest = sha256_hex(&bytes);
+    // stream paging: hash digest equals sha256(full_file_bytes)
+    let mut hasher = Sha256::new();
+    let mut offset: usize = 0;
+    let mut eof = false;
 
-    let text = String::from_utf8_lossy(&bytes);
     let mut total = 0i64;
     let mut valid = 0i64;
     let mut invalid = 0i64;
     let mut parse_err = 0i64;
     let mut policy_ids = std::collections::HashSet::<String>::new();
 
-    for ln in text.lines() {
+    while !eof {
+        let (chunk, chunk_eof, next_offset) = fetch_ledger_chunk(relay_base, url_endpoint, offset, PAGE_MAX_LINES).await?;
+        hasher.update(&chunk);
+
+        let text = String::from_utf8_lossy(&chunk);
+        for ln in text.lines() {
+            let t = ln.trim();
+            if t.is_empty() { continue; }
+            total += 1;
+            match serde_json::from_str::<Value>(t) {
+                Ok(v) => {
+                    if let Some(pid) = v.get("receipt_payload").and_then(|p| p.get("policy_id")).and_then(|x| x.as_str()) {
+                        policy_ids.insert(pid.to_string());
+                    }
+                    match verify_ssr_line(t) {
+                        Ok(true) => valid += 1,
+                        Ok(false) => invalid += 1,
+                        Err(_) => { invalid += 1; }
+                    }
+                }
+                Err(_) => { parse_err += 1; }
+            }
+        }
+
+        eof = chunk_eof;
+        offset = next_offset;
+        if chunk.is_empty() { break; }
+    }
+
+    let digest = hex::encode(hasher.finalize());
+    // (paging loop handles counting)
+
+    for ln in [].iter() {
         let t = ln.trim();
         if t.is_empty() { continue; }
         total += 1;
@@ -127,12 +122,34 @@ pub async fn run_ledger_audit(relay_base: &str, params: &Value) -> Result<Value>
     let top_n = params.get("top_n").and_then(|v| v.as_i64()).unwrap_or(1000).max(1) as usize;
     let endpoint = params.get("ledger_endpoint").and_then(|v| v.as_str())
         .unwrap_or(&format!("/v1/ledger/ssr/{date}"));
-    let url = format!("{}{}", relay_base.trim_end_matches('/'), endpoint);
-
-    let bytes = fetch_limited(&url).await?;
-    let text = String::from_utf8_lossy(&bytes);
+    let url_endpoint = params.get("ledger_endpoint").and_then(|v| v.as_str())
+        .unwrap_or(&format!("/v1/ledger/ssr/{date}"));
 
     let mut total = 0i64;
+    let mut credits: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    let mut offset: usize = 0;
+    let mut eof = false;
+
+    while !eof {
+        let (chunk, chunk_eof, next_offset) = fetch_ledger_chunk(relay_base, url_endpoint, offset, PAGE_MAX_LINES).await?;
+        let text = String::from_utf8_lossy(&chunk);
+
+        for ln in text.lines() {
+            let t = ln.trim();
+            if t.is_empty() { continue; }
+            total += 1;
+            let ssr: Value = match serde_json::from_str(t) { Ok(v) => v, Err(_) => continue };
+            let payload = match ssr.get("receipt_payload") { Some(p) => p, None => continue };
+            let dev = match payload.get("device_id").and_then(|v| v.as_str()) { Some(x) => x, None => continue };
+            let delta = payload.get("credits_delta_micro").and_then(|v| v.as_i64()).unwrap_or(0);
+            *credits.entry(dev.to_string()).or_insert(0) += delta;
+        }
+
+        eof = chunk_eof;
+        offset = next_offset;
+        if chunk.is_empty() { break; }
+    }
     let mut credits: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
     for ln in text.lines() {
