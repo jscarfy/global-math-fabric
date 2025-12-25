@@ -1,0 +1,35 @@
+name: publish-macos-dmg-to-pages
+
+on:
+  workflow_run:
+    workflows: ["release-macos"]
+    types: [completed]
+
+jobs:
+  stage:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macos artifact from triggering workflow
+        uses: actions/download-artifact@v4
+        with:
+          name: macos
+          path: dist/updates/macos
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage DMG into releases/macos
+        run: |
+          mkdir -p releases/macos
+          cp -f dist/updates/macos/gmf-macos.dmg releases/macos/gmf-macos.dmg
+          ls -lh releases/macos/gmf-macos.dmg
+
+      - name: Commit DMG back to repo (triggers publish-pages.yml)
+        run: |
+          git config user.name "gmf-bot"
+          git config user.email "gmf-bot@users.noreply.github.com"
+          git add releases/macos/gmf-macos.dmg
+          git commit -m "release: publish notarized macOS dmg from CI" || true
+          git push || true
