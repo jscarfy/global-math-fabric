@@ -57,6 +57,20 @@ async fn fetch_ledger_chunk(relay_base: &str, endpoint: &str, offset_lines: usiz
         for ln in text.lines() {
             let t = ln.trim();
             if t.is_empty() { continue; }
+
+
+async fn fetch_snapshot_json(relay_base: &str, date: &str) -> Result<serde_json::Value> {
+    let url = format!("{}/v1/ledger/snapshot/{}", relay_base.trim_end_matches('/'), date);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PAGE_TIMEOUT_SECS))
+        .build()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("snapshot fetch failed: {}", resp.status()));
+    }
+    let txt = resp.text().await?;
+    Ok(serde_json::from_str(&txt)?)
+}
             total += 1;
             match serde_json::from_str::<Value>(t) {
                 Ok(v) => {
@@ -79,6 +93,15 @@ async fn fetch_ledger_chunk(relay_base: &str, endpoint: &str, offset_lines: usiz
     }
 
     let digest = hex::encode(hasher.finalize());
+    let mut snapshot_match = None;
+    let mut snapshot_sha256 = None;
+    if let Ok(snap) = fetch_snapshot_json(relay_base, date).await {
+        if let Some(h) = snap.get("ssr_sha256").and_then(|v| v.as_str()) {
+            snapshot_sha256 = Some(h.to_string());
+            snapshot_match = Some(h == digest);
+        }
+    }
+
     // (paging loop handles counting)
 
     for ln in [].iter() {
@@ -113,6 +136,8 @@ async fn fetch_ledger_chunk(relay_base: &str, endpoint: &str, offset_lines: usiz
         "ssr_parse_errors": parse_err,
         "policy_ids": pids,
         "ledger_digest_sha256": digest,
+        "snapshot_sha256": snapshot_sha256,
+        "snapshot_match": snapshot_match,
         "relay_base_url": relay_base
     }))
 }
