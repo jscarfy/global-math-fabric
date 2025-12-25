@@ -30,6 +30,11 @@ curl -fsS "${RELAY}/v1/ledger/final/${DATE}" > "ledger/snapshots/${DATE}.final.j
 mkdir -p ledger/audit
 curl -fsS "${RELAY}/v1/audit/summary/${DATE}" > "ledger/audit/${DATE}.audit_summary.json" || true
 
+
+# 4.5) fetch audit_final (best-effort; immutable)
+curl -fsS "${RELAY}/v1/audit/final/${DATE}" > "ledger/audit/${DATE}.audit_final.json" || true
+
+
 ./tools/audit/export_audit_points.py "${DATE}"
 
 echo "OK: settled ${DATE} using immutable final snapshot anchor."
