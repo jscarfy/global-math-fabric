@@ -1253,6 +1253,109 @@ async fn audit_summary(
     Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
 }
 
+
+fn audit_final_path(date: &str) -> PathBuf {
+    PathBuf::from("ledger/audit").join(format!("{date}.audit_final.json"))
+}
+
+fn compute_audit_final_payload(date: &str) -> Result<serde_json::Value, String> {
+    // require final snapshot exists (settlement anchor)
+    let finalp = final_snapshot_path(date);
+    if !finalp.exists() { return Err("no final snapshot".into()); }
+    let final_txt = std::fs::read_to_string(&finalp).map_err(|e| e.to_string())?;
+    let final_env: serde_json::Value = serde_json::from_str(&final_txt).map_err(|e| e.to_string())?;
+    let final_ssr_sha256 = final_env.get("final_payload").and_then(|p| p.get("ssr_sha256")).and_then(|v| v.as_str())
+        .ok_or("bad final format")?.to_string();
+
+    let final_server_pubkey_b64 = final_env.get("server_pubkey_b64").cloned().unwrap_or(serde_json::Value::Null);
+    let final_server_sig_b64 = final_env.get("server_sig_b64").cloned().unwrap_or(serde_json::Value::Null);
+
+    // audit log bytes hash
+    let ap = audit_path(date);
+    if !ap.exists() { return Err("no audit log".into()); }
+    let bytes = std::fs::read(&ap).map_err(|e| e.to_string())?;
+    let audit_total_bytes = bytes.len() as i64;
+    let audit_total_lines = bytes.iter().filter(|b| **b == b'\n').count() as i64
+        + if bytes.len() > 0 && *bytes.last().unwrap() != b'\n' { 1 } else { 0 };
+    let audit_log_sha256 = sha256_hex_bytes(&bytes);
+
+    // compute summary stats (reuse compute_audit_summary which verifies audit_env signatures best-effort)
+    let sum = compute_audit_summary(date)?;
+    Ok(serde_json::json!({
+        "date": date,
+        "finalized_at_unix_ms": now_unix_ms(),
+        "audit_log_sha256": audit_log_sha256,
+        "audit_total_lines": audit_total_lines,
+        "audit_total_bytes": audit_total_bytes,
+        "audit_sig_ok": sum.get("audit_sig_ok").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "audit_sig_bad": sum.get("audit_sig_bad").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "audit_parse_errors": sum.get("audit_parse_errors").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "unique_devices": sum.get("unique_devices").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "unique_device_pubkeys": sum.get("unique_device_pubkeys").cloned().unwrap_or(serde_json::Value::Number(0.into())),
+        "final_ssr_sha256": final_ssr_sha256,
+        "final_server_pubkey_b64": final_server_pubkey_b64,
+        "final_server_sig_b64": final_server_sig_b64
+    }))
+}
+
+fn write_audit_final_once(date: &str) -> Result<serde_json::Value, String> {
+    let outp = audit_final_path(date);
+    if outp.exists() {
+        let txt = std::fs::read_to_string(&outp).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+        return Ok(v);
+    }
+
+    let payload = compute_audit_final_payload(date)?;
+    let canon = canonical_json_bytes(&payload);
+    let msg = sha2::Sha256::digest(&canon);
+    let sig_b64 = server_sign_fn.as_ref()(&msg);
+
+    let env = serde_json::json!({
+        "audit_final_payload": payload,
+        "server_pubkey_b64": server_pubkey_b64_str,
+        "server_sig_b64": sig_b64
+    });
+
+    if let Some(parent) = outp.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let tmp = outp.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&env).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &outp).map_err(|e| e.to_string())?;
+    Ok(env)
+}
+
+async fn audit_final(
+    axum::extract::Path(date): axum::extract::Path<String>
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    if date.len() != 10 || &date[4..5] != "-" || &date[7..8] != "-" {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into()));
+    }
+    let path = audit_final_path(&date);
+    if !path.exists() {
+        return Err((axum::http::StatusCode::NOT_FOUND, "no audit_final".into()));
+    }
+    let txt = std::fs::read_to_string(&path)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((axum::http::StatusCode::OK, txt))
+}
+
+async fn audit_finalize(
+    axum::extract::Path(date): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String,String>>
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    let admin = std::env::var("GMF_ADMIN_TOKEN").unwrap_or_default();
+    let tok = q.get("token").cloned().unwrap_or_default();
+    if !admin.is_empty() && tok != admin {
+        return Err((axum::http::StatusCode::FORBIDDEN, "forbidden".into()));
+    }
+    if date.len() != 10 || &date[4..5] != "-" || &date[7..8] != "-" {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into()));
+    }
+    let env = write_audit_final_once(&date)
+        .map_err(|e| (axum::http::StatusCode::PRECONDITION_FAILED, e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
@@ -1316,6 +1419,37 @@ async fn main() -> anyhow::Result<()> {
             sleep(Duration::from_secs(finalize_interval_secs)).await;
         }
     });
+    // auto-finalize yesterday audit_final after audit log quiet for grace seconds (UTC)
+    let audit_finalize_grace_secs: u64 = env::var("GMF_AUDIT_FINALIZE_GRACE_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(900);
+    let audit_finalize_interval_secs: u64 = env::var("GMF_AUDIT_FINALIZE_INTERVAL_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(60);
+
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        loop {
+            let now = Utc::now();
+            let y = now - chrono::Duration::days(1);
+            let date = format!("{:04}-{:02}-{:02}", y.year(), y.month(), y.day());
+
+            let ap = audit_path(&date);
+            let af = audit_final_path(&date);
+
+            if ap.exists() && !af.exists() {
+                if let Ok(md) = std::fs::metadata(&ap) {
+                    if let Ok(mtime) = md.modified() {
+                        if let Ok(elapsed) = mtime.elapsed() {
+                            if elapsed.as_secs() >= audit_finalize_grace_secs {
+                                let _ = write_audit_final_once(&date);
+                            }
+                        }
+                    }
+                }
+            }
+            sleep(Duration::from_secs(audit_finalize_interval_secs)).await;
+        }
+    });
+
 
 
     let app = Router::new()
@@ -1328,6 +1462,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/audit/attest", post(audit_attest))
         .route("/v1/audit/log/:date", get(audit_log))
         .route("/v1/audit/summary/:date", get(audit_summary))
+        .route("/v1/audit/final/:date", get(audit_final))
+        .route("/v1/audit/finalize/:date", get(audit_finalize))
         .route("/v1/tasks/pull", post(pull_task))
         .route("/v1/tasks/submit", post(submit_task))
         .with_state(state);
