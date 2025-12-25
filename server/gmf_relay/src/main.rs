@@ -660,6 +660,22 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     }
 }
 
+
+async fn ledger_ssr(axum::extract::Path(date): axum::extract::Path<String>)
+-> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    // Strict date whitelist-ish
+    if date.len() != 10 || &date[4..5] != "-" || &date[7..8] != "-" {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into()));
+    }
+    let path = PathBuf::from("ledger/inbox").join(format!("{date}.ssr.jsonl"));
+    if !path.exists() {
+        return Err((axum::http::StatusCode::NOT_FOUND, "no such ledger day".into()));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let body = String::from_utf8_lossy(&bytes).to_string();
+    Ok((axum::http::StatusCode::OK, body))
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
@@ -679,6 +695,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/ledger/ssr/:date", get(ledger_ssr))
         .route("/v1/tasks/pull", post(pull_task))
         .route("/v1/tasks/submit", post(submit_task))
         .with_state(state);
