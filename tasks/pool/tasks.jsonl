@@ -2,4 +2,4 @@
 {"protocol":"gmf/task/v1","task_id":"fib-0002","kind":"fibonacci","params":{"n":750000},"credit_micro":8000}
 {"protocol":"gmf/task/v1","task_id":"prime-0001","kind":"is_prime_64","params":{"x":18446744073709551557},"credit_micro":200}
 {"protocol":"gmf/task/v1","task_id":"prime-0002","kind":"is_prime_64","params":{"x":18446744073709551533},"credit_micro":200}
-{"protocol":"gmf/task/v1","task_id":"lean-0001","kind":"lean_check","params":{"git_url":"https://github.com/leanprover-community/mathlib4.git","rev":"ed35afa570e124aee52f8d15030649bdd0e21f87","subdir":"","cmd":["lake","build"],"use_mathlib_cache":true},"credit_micro_total":20000,"replicas":2}
+{"protocol":"gmf/task/v1","task_id":"lean-0001","kind":"lean_check","params":{"git_url":"https://github.com/leanprover-community/mathlib4.git","rev":"ed35afa570e124aee52f8d15030649bdd0e21f87","subdir":"","cmd":["lake","build"],"use_mathlib_cache":true,"artifacts_root":".lake/build/lib","require_artifact_hash":true,"docker_image":"leanprovercommunity/lean:latest"},"credit_micro_total":20000,"replicas":2}
