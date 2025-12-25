@@ -1,3 +1,4 @@
+from fastapi.responses import PlainTextResponse
 from fastapi.responses import JSONResponse
 import random
 import base64
@@ -168,6 +169,18 @@ def pull_job(device_id: str, topics: str = ""):
             accepted = False
             reason = 'policy_hash_mismatch'
             awarded_credits = 0
+        # bind policy to this lease (prevents cross-policy replay)
+        if accepted and lc is not None:
+            lease_pol = str(getattr(lc,'policy_hash','') or '').lower()
+            if lease_pol and lease_pol != str(GMF_POLICY_HASH).lower():
+                accepted = False
+                reason = 'lease_policy_hash_mismatch'
+                awarded_credits = 0
+            elif lease_pol and str(submitted_policy).lower() != lease_pol:
+                accepted = False
+                reason = 'submitted_policy_not_equal_lease_policy'
+                awarded_credits = 0
+
 
 
         if lc is not None:
@@ -494,13 +507,13 @@ def _write_audit_bundle(proof_hash: str, bundle_bytes: bytes) -> dict:
     (path.with_suffix(".meta.json")).write_bytes(_canon_json_bytes(meta))
     return meta
 
-def _lease_challenge_put(db, lease_id: str, device_id: str, job_id: str, nonce_hex: str, audit_required: bool, required_fields: list[str], ts_utc: str, seed_hex: str = "", chunk_size: int = 65536, sample_k: int = 3):
+def _lease_challenge_put(db, lease_id: str, device_id: str, job_id: str, nonce_hex: str, audit_required: bool, required_fields: list[str], ts_utc: str, seed_hex: str = "", chunk_size: int = 65536, sample_k: int = 3, policy_hash: str = ""):
     rf = _csv_norm(",".join(required_fields))
     row = db.query(LeaseChallenge).filter(LeaseChallenge.lease_id == lease_id).first()
     if row is None:
         row = LeaseChallenge(
             lease_id=lease_id, device_id=device_id, job_id=job_id,
-            nonce_hex=nonce_hex, seed_hex=seed_hex, chunk_size=int(chunk_size), sample_k=int(sample_k),
+            nonce_hex=nonce_hex, seed_hex=seed_hex, chunk_size=int(chunk_size), sample_k=int(sample_k), policy_hash=str(policy_hash),
             audit_required=1 if audit_required else 0, required_fields_csv=rf, created_ts_utc=ts_utc,
         )
         db.add(row)
@@ -509,6 +522,7 @@ def _lease_challenge_put(db, lease_id: str, device_id: str, job_id: str, nonce_h
         row.seed_hex = seed_hex
         row.chunk_size = int(chunk_size)
         row.sample_k = int(sample_k)
+        row.policy_hash = str(policy_hash)
         row.audit_required = 1 if audit_required else 0
         row.required_fields_csv = rf
         row.created_ts_utc = ts_utc
@@ -697,3 +711,25 @@ def policy_by_hash(policy_hash: str):
         "policy": hit,
         "hint": "Fetch policy file content via git mirror path in 'relpath' (policy text not served here).",
     })
+
+GMF_SERVE_POLICY_TEXT = os.environ.get('GMF_SERVE_POLICY_TEXT','0').strip() in ('1','true','TRUE','yes','YES')
+
+@router.get("/policy/text/{policy_hash}")
+def policy_text(policy_hash: str):
+    if not GMF_SERVE_POLICY_TEXT:
+        return JSONResponse({"ok": False, "error": "policy_text_serving_disabled"}, status_code=403)
+    policy_hash = (policy_hash or "").strip().lower()
+    reg = _load_or_build_policy_registry()
+    hit = None
+    for it in reg.get("policies", []):
+        if str(it.get("sha256","")).lower() == policy_hash:
+            hit = it
+            break
+    if not hit:
+        return JSONResponse({"ok": False, "error": "policy_not_found", "query_hash": policy_hash}, status_code=404)
+    pth = Path(hit.get("relpath",""))
+    if not pth.exists():
+        return JSONResponse({"ok": False, "error": "policy_file_missing", "relpath": str(pth)}, status_code=404)
+    txt = pth.read_text(encoding="utf-8", errors="replace")
+    # serve as plain text
+    return PlainTextResponse(txt, media_type="text/plain; charset=utf-8")

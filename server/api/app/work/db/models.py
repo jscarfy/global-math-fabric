@@ -23,6 +23,7 @@ class JobLease(BaseWork):
     __tablename__ = "job_leases"
     lease_id = Column(String, primary_key=True)
     job_id = Column(String, nullable=False, index=True)
+    policy_hash = Column(String, nullable=False, default="")
     device_id = Column(String, nullable=False, index=True)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     active = Column(Boolean, nullable=False, default=True)
