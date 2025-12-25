@@ -410,3 +410,92 @@ Ok(serde_json::json!({
         "relay_base_url": relay_base
     }))
 }
+
+
+async fn fetch_final_json(relay_base: &str, date: &str) -> Result<serde_json::Value> {
+    let url = format!("{}/v1/ledger/final/{}", relay_base.trim_end_matches('/'), date);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PAGE_TIMEOUT_SECS))
+        .build()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("final snapshot fetch failed: {}", resp.status()));
+    }
+    let txt = resp.text().await?;
+    Ok(serde_json::from_str(&txt)?)
+}
+
+fn canonical_json_bytes_local(v: &Value) -> Vec<u8> {
+    fn sort(v: &Value) -> Value {
+        match v {
+            Value::Object(map) => {
+                let mut keys: Vec<_> = map.keys().cloned().collect();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for k in keys {
+                    out.insert(k.clone(), sort(&map[&k]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sort).collect()),
+            _ => v.clone()
+        }
+    }
+    serde_json::to_vec(&sort(v)).unwrap()
+}
+
+fn verify_final_snapshot_sig(final_env: &Value) -> Result<bool> {
+    let payload = final_env.get("final_payload").ok_or_else(|| anyhow!("missing final_payload"))?;
+    let pk_b64 = final_env.get("server_pubkey_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_pubkey_b64"))?;
+    let sig_b64 = final_env.get("server_sig_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_sig_b64"))?;
+
+    let pk_bytes = B64.decode(pk_b64)?;
+    let pk = VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| anyhow!("bad pk bytes"))?)
+        .map_err(|_| anyhow!("bad pk"))?;
+
+    let sig_bytes = B64.decode(sig_b64)?;
+    let sig = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| anyhow!("bad sig bytes"))?);
+
+    let canon = canonical_json_bytes_local(payload);
+    let msg = Sha256::digest(&canon);
+
+    Ok(pk.verify(&msg, &sig).is_ok())
+}
+
+fn read_canonical_pubkey_b64() -> Option<String> {
+    let p = std::path::PathBuf::from("ledger/identity/server_pubkey_b64.txt");
+    std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+pub async fn run_final_verify(relay_base: &str, params: &Value) -> Result<Value> {
+    let date = params.get("date").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing params.date"))?;
+    let final_env = fetch_final_json(relay_base, date).await?;
+
+    let sig_ok = verify_final_snapshot_sig(&final_env)?;
+    let pk_b64 = final_env.get("server_pubkey_b64").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let canonical_pk = read_canonical_pubkey_b64();
+    let pk_match = canonical_pk.as_ref().map(|c| c == &pk_b64);
+
+    // optional: verify inbox sha matches final_payload.ssr_sha256 if local inbox file exists
+    let mut inbox_match = None;
+    let inbox_path = std::path::PathBuf::from("ledger/inbox").join(format!("{}.ssr.jsonl", date));
+    if inbox_path.exists() {
+        let bytes = std::fs::read(&inbox_path)?;
+        let inbox_sha = sha256_hex_bytes(&bytes);
+        let expected = final_env.get("final_payload").and_then(|p| p.get("ssr_sha256")).and_then(|v| v.as_str()).map(|s| s.to_string());
+        inbox_match = expected.map(|e| e == inbox_sha);
+    }
+
+    Ok(serde_json::json!({
+        "ok": sig_ok && pk_match.unwrap_or(true),
+        "exit_code": if sig_ok && pk_match.unwrap_or(true) { 0 } else { 2 },
+        "date": date,
+        "final_sig_ok": sig_ok,
+        "server_pubkey_b64": pk_b64,
+        "canonical_pubkey_b64": canonical_pk,
+        "pubkey_matches_canonical": pk_match,
+        "inbox_sha_matches_final": inbox_match,
+        "relay_base_url": relay_base
+    }))
+}
