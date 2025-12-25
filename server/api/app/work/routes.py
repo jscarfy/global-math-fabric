@@ -1,3 +1,4 @@
+GMF_AUDIT_CHUNK_SIZE = int(os.environ.get('GMF_AUDIT_CHUNK_SIZE','32768'))
 from fastapi.responses import PlainTextResponse
 from fastapi.responses import JSONResponse
 import random
