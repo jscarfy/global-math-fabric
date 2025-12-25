@@ -1104,3 +1104,14 @@ def ledger_checkpoint_status():
         "lag_entries": int(head_n - cpn),
         "checkpoint": cp
     }
+
+
+@app.get("/ledger/checkpoint/pending/latest")
+def ledger_checkpoint_pending_latest():
+    p = checkpointing.latest_pending_checkpoint()
+    return {"ok": bool(p), "pending": p}
+
+@app.get("/ledger/checkpoint/pending/list")
+def ledger_checkpoint_pending_list(limit: int = 20):
+    files = checkpointing.list_pending_checkpoints(limit=int(limit))
+    return {"ok": True, "limit": int(limit), "files": files}

@@ -179,3 +179,27 @@ def latest_checkpoint() -> Dict[str, Any] | None:
 def _mc() -> MerkleCache:
     dbp = os.environ.get("GMF_MERKLE_DB", "ledger/cache/merkle_nodes.sqlite")
     return MerkleCache(dbp)
+
+
+def list_pending_checkpoints(limit: int = 20) -> list[str]:
+    ensure_dirs()
+    limit = max(1, min(200, int(limit)))
+    files = []
+    for fn in os.listdir(pending_dir()):
+        if fn.startswith("pending-") and fn.endswith(".json"):
+            files.append(fn)
+    files.sort()
+    return files[-limit:]
+
+def latest_pending_checkpoint() -> Dict[str, Any] | None:
+    ensure_dirs()
+    files = []
+    for fn in os.listdir(pending_dir()):
+        if fn.startswith("pending-") and fn.endswith(".json"):
+            files.append(fn)
+    if not files:
+        return None
+    files.sort()
+    path = os.path.join(pending_dir(), files[-1])
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
