@@ -105,6 +105,7 @@ dev_dependencies:
 dependency_overrides:
 
 msix_config:
+  install_certificate: false
   certificate_password: "${MSIX_PFX_PASSWORD}"
   certificate_path: "../../certs/gmf.pfx"
   display_name: Global Math Fabric
