@@ -360,7 +360,19 @@ fn hard_gate_check(task: &TaskSpec, result_core: &Value) -> Option<String> {
     }
 
     // optional file hard-gates
-    for (ek, rk) in [
+    
+    // optional artifacts hard-gate
+    if task.params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true) {
+        if let Some(ev) = task.params.get("expected_artifacts_manifest_sha256").and_then(|v| v.as_str()) {
+            if !ev.is_empty() {
+                let got = result_core.get("artifacts_manifest_sha256").and_then(|v| v.as_str()).unwrap_or("");
+                if got != ev {
+                    return Some(format!("expected_artifacts_manifest_sha256 mismatch: expected={ev} got={got}"));
+                }
+            }
+        }
+    }
+for (ek, rk) in [
         ("expected_lean_toolchain_sha256","lean_toolchain_sha256"),
         ("expected_lakefile_sha256","lakefile_sha256"),
         ("expected_lake_manifest_sha256","lake_manifest_sha256"),
