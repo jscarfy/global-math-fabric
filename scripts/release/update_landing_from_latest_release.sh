@@ -70,6 +70,18 @@ mac_zip = pick([r"mac", r"\.zip$"])  # best-effort if you upload gmf-macos.zip
 # Sparkle appcast always from Pages
 appcast = f"{pages}/releases/appcast.xml"
 install_md = f"{pages}/releases/INSTALL.md"
+
+ios_link = ""
+p_ios = Path("releases/ios_testflight_link.txt")
+if p_ios.exists():
+    ios_link = (p_ios.read_text().splitlines()[0].strip() if p_ios.read_text().splitlines() else "")
+    # allow comments
+    for line in p_ios.read_text().splitlines():
+        t=line.strip()
+        if t and not t.startswith('#'):
+            ios_link=t
+            break
+
 landing = f"{pages}/"
 
 def btn(href, text):
