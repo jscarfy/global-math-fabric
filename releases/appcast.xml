@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+  <channel>
+    <title>GMF Desktop Updates</title>
+    <item>
+      <title>0.1.0</title>
+      <sparkle:version>0.1.0</sparkle:version>
+      <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+      <!-- TODO: fill enclosure url + length + signature (Sparkle) -->
+      <description>Initial desktop release.</description>
+    </item>
+  </channel>
+</rss>
