@@ -4,7 +4,7 @@ use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer};
 use rand::rngs::OsRng;
 use serde_json::Value;
-use std::{fs, path::PathBuf, thread, time::Duration, process::Command};
+use std::{fs, path::{Path, PathBuf}, thread, time::Duration, process::Command};
 
 use gmf_receipts::{jcs_canonicalize, sha256, sha256_hex};
 use tempfile::tempdir;
@@ -83,57 +83,22 @@ fn run_cmd(mut cmd: Command) -> anyhow::Result<(i32, String)> {
     Ok((code, s))
 }
 
-/// Docker script writes /workspace/.gmf_result_core.json
-fn solve_lean_check(task: &Value) -> anyhow::Result<Value> {
-    let params = task.get("params").context("missing params")?;
-    let git_url = params.get("git_url").and_then(|v| v.as_str()).context("missing git_url")?;
-    let rev = params.get("rev").and_then(|v| v.as_str()).context("missing rev")?;
-    let subdir = params.get("subdir").and_then(|v| v.as_str()).unwrap_or("");
-    let use_cache = params.get("use_mathlib_cache").and_then(|v| v.as_bool()).unwrap_or(true);
-    let artifacts_root = params.get("artifacts_root").and_then(|v| v.as_str()).unwrap_or(".lake/build/lib");
-    let docker_image = params.get("docker_image").and_then(|v| v.as_str()).unwrap_or("leanprovercommunity/lean:latest");
+fn sha256_file_hex(p: &Path) -> anyhow::Result<String> {
+    if !p.exists() { return Ok("".into()); }
+    let bytes = fs::read(p)?;
+    Ok(hex::encode(sha256(&bytes)))
+}
 
-    let require_digest = params.get("require_digest").and_then(|v| v.as_bool()).unwrap_or(true);
-    if require_digest && !docker_image.contains("@sha256:") {
-        // deterministic failure: unpinned docker image
-        return Ok(serde_json::json!({
-            "ok": false,
-            "exit_code": 3,
-            "build_log_sha256": hex::encode(sha256(b"docker_image_not_digest_pinned")),
-            "artifacts_root": artifacts_root,
-            "artifacts_count": 0,
-            "artifacts_manifest_sha256": "",
-            "docker_image": docker_image
-        }));
+fn git_rev_parse(repo: &Path, spec: &str) -> anyhow::Result<String> {
+    let (code, out) = run_cmd(Command::new("git").args(["rev-parse", spec]).current_dir(repo))?;
+    if code != 0 {
+        return Err(anyhow!("git rev-parse failed ({spec}): {out}"));
     }
+    Ok(out.trim().to_string())
+}
 
-    let require_artifact_hash = params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
-
-    let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned()
-        .unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
-    let cmd_vec: Vec<String> = cmd_arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-    if cmd_vec.is_empty() { return Err(anyhow!("empty cmd")); }
-
-    // clone into temp dir
-    let dir = tempdir()?;
-    let repo = dir.path().join("repo");
-    fs::create_dir_all(&repo)?;
-
-    run_cmd(Command::new("git").arg("init").current_dir(&repo))?;
-    run_cmd(Command::new("git").args(["remote","add","origin", git_url]).current_dir(&repo))?;
-    run_cmd(Command::new("git").args(["fetch","--depth","1","origin", rev]).current_dir(&repo))?;
-    run_cmd(Command::new("git").args(["checkout","FETCH_HEAD"]).current_dir(&repo))?;
-
-    let workdir = if subdir.is_empty() { repo.clone() } else { repo.join(subdir) };
-    if !workdir.exists() {
-        return Err(anyhow!("subdir does not exist: {}", workdir.display()));
-    }
-
-    // Build inside docker:
-    // - capture all output to /workspace/.gmf_build.log
-    // - compute build_log_sha256
-    // - compute artifacts manifest + sha (if require_artifact_hash)
-    // - write result_core JSON to /workspace/.gmf_result_core.json
+/// Docker script writes /workspace/.gmf_result_core.json (partial: build+artifacts)
+fn docker_build_and_hash(repo: &Path, subdir: &str, artifacts_root: &str, docker_image: &str, use_cache: bool, cmd_vec: &[String], require_artifact_hash: bool) -> anyhow::Result<Value> {
     let bash = format!(r#"
 set +e
 cd /workspace/{subdir}
@@ -141,10 +106,9 @@ LOG="/workspace/.gmf_build.log"
 RES="/workspace/.gmf_result_core.json"
 ARTROOT="/workspace/{subdir}/{artifacts_root}"
 
-( {"cache_cmd"} {cmd} ) >"$LOG" 2>&1
+( {cache_cmd} {cmd} ) >"$LOG" 2>&1
 RC=$?
 
-# build log hash
 BLH=$(sha256sum "$LOG" | awk '{{print $1}}')
 
 OK=false
@@ -154,13 +118,11 @@ ART_COUNT=0
 ART_MANIFEST_SHA=""
 if {require_hash}; then
   if [ -d "$ARTROOT" ]; then
-    # manifest sorted by path, format: "<sha>  <relpath>"
     MAN="/workspace/.gmf_artifacts.manifest"
     (cd "$ARTROOT" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$MAN"
     ART_COUNT=$(wc -l < "$MAN" | tr -d ' ')
     ART_MANIFEST_SHA=$(sha256sum "$MAN" | awk '{{print $1}}')
   else
-    # required but missing => fail deterministic hash
     OK=false
     RC=2
     ART_COUNT=0
@@ -182,7 +144,6 @@ exit 0
         require_hash= if require_artifact_hash { "true" } else { "false" },
     );
 
-    // run docker
     let (code, log) = run_cmd(
         Command::new("docker")
             .arg("run").arg("--rm")
@@ -191,8 +152,8 @@ exit 0
             .arg(docker_image)
             .arg("bash").arg("-lc").arg(bash)
     )?;
+
     if code != 0 {
-        // docker itself failed
         return Ok(serde_json::json!({
             "ok": false,
             "exit_code": 127,
@@ -204,11 +165,101 @@ exit 0
         }));
     }
 
-    // read result_core from repo root
     let result_path = repo.join(".gmf_result_core.json");
     let txt = fs::read_to_string(&result_path).context("missing .gmf_result_core.json")?;
-    let v: Value = serde_json::from_str(&txt).context("bad result_core json")?;
+    let v: Value = serde_json::from_str(&txt).context("bad .gmf_result_core.json")?;
     Ok(v)
+}
+
+fn solve_lean_check(task: &Value) -> anyhow::Result<Value> {
+    let params = task.get("params").context("missing params")?;
+    let git_url = params.get("git_url").and_then(|v| v.as_str()).context("missing git_url")?;
+    let rev = params.get("rev").and_then(|v| v.as_str()).context("missing rev")?;
+    let subdir = params.get("subdir").and_then(|v| v.as_str()).unwrap_or("");
+    let use_cache = params.get("use_mathlib_cache").and_then(|v| v.as_bool()).unwrap_or(true);
+    let artifacts_root = params.get("artifacts_root").and_then(|v| v.as_str()).unwrap_or(".lake/build/lib");
+
+    let docker_image = params.get("docker_image").and_then(|v| v.as_str()).unwrap_or("leanprovercommunity/lean:latest");
+    let require_digest = params.get("require_digest").and_then(|v| v.as_bool()).unwrap_or(true);
+    if require_digest && !docker_image.contains("@sha256:") {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "exit_code": 3,
+            "build_log_sha256": hex::encode(sha256(b"docker_image_not_digest_pinned")),
+            "artifacts_root": artifacts_root,
+            "artifacts_count": 0,
+            "artifacts_manifest_sha256": "",
+            "docker_image": docker_image,
+            "git_rev": "",
+            "git_tree": "",
+            "lean_toolchain_sha256": "",
+            "lakefile_sha256": "",
+            "lake_manifest_sha256": ""
+        }));
+    }
+
+    let require_artifact_hash = params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+    let require_source_hash = params.get("require_source_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned()
+        .unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
+    let cmd_vec: Vec<String> = cmd_arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+    if cmd_vec.is_empty() { return Err(anyhow!("empty cmd")); }
+
+    // clone into temp dir
+    let dir = tempdir()?;
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo)?;
+
+    run_cmd(Command::new("git").arg("init").current_dir(&repo))?;
+    run_cmd(Command::new("git").args(["remote","add","origin", git_url]).current_dir(&repo))?;
+    run_cmd(Command::new("git").args(["fetch","--depth","1","origin", rev]).current_dir(&repo))?;
+    run_cmd(Command::new("git").args(["checkout","FETCH_HEAD"]).current_dir(&repo))?;
+
+    let workdir = if subdir.is_empty() { repo.clone() } else { repo.join(subdir) };
+    if !workdir.exists() {
+        return Err(anyhow!("subdir does not exist: {}", workdir.display()));
+    }
+
+    // HOST-computed source pinning
+    let (git_rev, git_tree, lean_toolchain_sha256, lakefile_sha256, lake_manifest_sha256) = if require_source_hash {
+        let git_rev = git_rev_parse(&repo, "HEAD")?;
+        let git_tree = git_rev_parse(&repo, "HEAD^{tree}")?;
+
+        // hash key files relative to workdir
+        let lean_toolchain_sha256 = sha256_file_hex(&workdir.join("lean-toolchain"))?;
+        let lake_manifest_sha256 = sha256_file_hex(&workdir.join("lake-manifest.json"))?;
+
+        let lakefile_sha256 = if workdir.join("Lakefile.lean").exists() {
+            sha256_file_hex(&workdir.join("Lakefile.lean"))?
+        } else {
+            sha256_file_hex(&workdir.join("lakefile.lean"))?
+        };
+
+        (git_rev, git_tree, lean_toolchain_sha256, lakefile_sha256, lake_manifest_sha256)
+    } else {
+        ("".into(),"".into(),"".into(),"".into(),"".into())
+    };
+
+    // Docker does build + artifacts hashing (partial result_core)
+    let mut partial = docker_build_and_hash(&repo, subdir, artifacts_root, docker_image, use_cache, &cmd_vec, require_artifact_hash)?;
+
+    // merge source pinning into result_core
+    if require_source_hash {
+        partial.as_object_mut().unwrap().insert("git_rev".into(), Value::String(git_rev));
+        partial.as_object_mut().unwrap().insert("git_tree".into(), Value::String(git_tree));
+        partial.as_object_mut().unwrap().insert("lean_toolchain_sha256".into(), Value::String(lean_toolchain_sha256));
+        partial.as_object_mut().unwrap().insert("lakefile_sha256".into(), Value::String(lakefile_sha256));
+        partial.as_object_mut().unwrap().insert("lake_manifest_sha256".into(), Value::String(lake_manifest_sha256));
+    } else {
+        partial.as_object_mut().unwrap().insert("git_rev".into(), Value::String("".into()));
+        partial.as_object_mut().unwrap().insert("git_tree".into(), Value::String("".into()));
+        partial.as_object_mut().unwrap().insert("lean_toolchain_sha256".into(), Value::String("".into()));
+        partial.as_object_mut().unwrap().insert("lakefile_sha256".into(), Value::String("".into()));
+        partial.as_object_mut().unwrap().insert("lake_manifest_sha256".into(), Value::String("".into()));
+    }
+
+    Ok(partial)
 }
 
 #[tokio::main]
@@ -274,7 +325,12 @@ async fn main() -> anyhow::Result<()> {
                     "artifacts_root": ".lake/build/lib",
                     "artifacts_count": 0,
                     "artifacts_manifest_sha256": "",
-                    "docker_image": "unknown"
+                    "docker_image": "unknown",
+                    "git_rev": "",
+                    "git_tree": "",
+                    "lean_toolchain_sha256": "",
+                    "lakefile_sha256": "",
+                    "lake_manifest_sha256": ""
                 }))
             }
             _ => {
@@ -284,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        // submit (result_core is now rich + hash-based)
+        // submit
         let submit_payload = serde_json::json!({
             "task_id": task_id,
             "result_core": result_core,
