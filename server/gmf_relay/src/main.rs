@@ -1003,6 +1003,22 @@ async fn ledger_finalize(
     Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&env).unwrap()))
 }
 
+
+async fn ledger_final(
+    axum::extract::Path(date): axum::extract::Path<String>
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    if date.len() != 10 || &date[4..5] != "-" || &date[7..8] != "-" {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into()));
+    }
+    let path = final_snapshot_path(&date);
+    if !path.exists() {
+        return Err((axum::http::StatusCode::NOT_FOUND, "no final snapshot".into()));
+    }
+    let txt = std::fs::read_to_string(&path)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((axum::http::StatusCode::OK, txt))
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
@@ -1074,6 +1090,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ledger/ssr_delta/:date", get(ledger_ssr_delta))
         .route("/v1/ledger/snapshot/:date", get(ledger_snapshot))
         .route("/v1/ledger/finalize/:date", get(ledger_finalize))
+        .route("/v1/ledger/final/:date", get(ledger_final))
         .route("/v1/tasks/pull", post(pull_task))
         .route("/v1/tasks/submit", post(submit_task))
         .with_state(state);
