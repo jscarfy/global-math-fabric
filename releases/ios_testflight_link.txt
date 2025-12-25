@@ -1,0 +1,2 @@
+# Put your TestFlight public invitation link here (one line), e.g.
+# https://testflight.apple.com/join/XXXXXXXX
