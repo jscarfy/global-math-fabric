@@ -229,3 +229,70 @@ pub async fn lease_execute_report_once(cfg: &Config, lease_seconds: i32) -> Resu
         note: rr.note,
     })
 }
+
+
+fn probe_desktop_capabilities() -> serde_json::Value {
+    // Minimal, cross-platform-ish probe
+    let cpu_count = num_cpus::get() as i64;
+
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_memory();
+    // sysinfo returns KB
+    let mem_kb = sys.total_memory() as f64;
+    let mem_gb = (mem_kb / 1024.0 / 1024.0).round(); // GB-ish
+
+    // GPU presence: best-effort. You can override via env GMF_GPU_PRESENT=1
+    let gpu_present_env = std::env::var("GMF_GPU_PRESENT").ok().map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false);
+    let gpu_present = if gpu_present_env {
+        true
+    } else {
+        #[cfg(target_os="linux")]
+        { std::path::Path::new("/dev/dri").exists() }
+        #[cfg(not(target_os="linux"))]
+        { false }
+    };
+
+    // Tier: simple bucketing
+    let tier = if gpu_present {
+        "gpu"
+    } else if cpu_count >= 8 && mem_gb >= 16.0 {
+        "cpu_high"
+    } else {
+        "cpu_low"
+    };
+
+    serde_json::json!({
+        "platform": "desktop",
+        "cpu_count": cpu_count,
+        "mem_gb": mem_gb,
+        "gpu_present": gpu_present,
+        "tier": tier,
+        "ts_unix": chrono::Utc::now().timestamp(),
+    })
+}
+
+fn heavy_work_iters() -> u64 {
+    std::env::var("GMF_HEAVY_WORK_ITERS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5_000_000)
+}
+
+/// Deterministic "work proof" for heavy tasks. Must be identical across machines.
+/// Seed ONLY from stable fields (instance_id + stdout_sha256).
+fn compute_work_proof(instance_id: &str, stdout_sha256: &str, iters: u64) -> (u64, String) {
+    use sha2::{Sha256, Digest};
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(instance_id.as_bytes());
+    buf.extend_from_slice(b"|");
+    buf.extend_from_slice(stdout_sha256.as_bytes());
+    let mut state = Sha256::digest(&buf).to_vec(); // 32 bytes
+
+    for _ in 0..iters {
+        let mut h = Sha256::new();
+        h.update(&state);
+        state = h.finalize().to_vec();
+    }
+    (iters, hex::encode(state))
+}
