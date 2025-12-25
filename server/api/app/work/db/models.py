@@ -52,6 +52,7 @@ class Device(BaseWork):
     ram_mb = Column(Integer, nullable=False, default=0)
     disk_mb = Column(Integer, nullable=False, default=0)
     topics_csv = Column(Text, nullable=True)                       # e.g. "algebra,nt,topology"
+    pubkey_b64 = Column(Text, nullable=True)                       # device ed25519 public key (base64, 32 bytes)
     meta_json = Column(Text, nullable=True)                        # canonical json string
     last_seen_at = Column(DateTime(timezone=True), server_default=func.now())
 

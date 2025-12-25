@@ -1,6 +1,7 @@
-import os, json, uuid, hashlib, datetime
+import os, json, uuid, hashlib, datetime, base64
 from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import Session
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from sqlalchemy import and_
 from .db.work_db import SessionWork
 from .db.models import Job, JobLease, WorkResult, Device, DeviceDaily
@@ -20,6 +21,21 @@ def _now():
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _b64dec(s: str) -> bytes:
+    return base64.b64decode(s.encode("ascii"))
+
+def _verify_device_sig(pub_b64: str, msg: str, sig_b64: str) -> bool:
+    try:
+        pk_bytes = _b64dec(pub_b64)
+        if len(pk_bytes) != 32:
+            return False
+        pk = Ed25519PublicKey.from_public_bytes(pk_bytes)
+        pk.verify(_b64dec(sig_b64), msg.encode("utf-8"))
+        return True
+    except Exception:
+        return False
 
 def _canon(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -149,7 +165,7 @@ def pull_job(device_id: str, topics: str = ""):
         db.close()
 
 @router.post("/jobs/submit")
-def submit_job(device_id: str, lease_id: str, job_id: str, output: dict):
+def submit_job(device_id: str, lease_id: str, job_id: str, output: dict, device_msg: str = "", device_sig_b64: str = ""):
     """
     Validate output; if accepted, mint signed work_receipt (server-signed) and write into ledger.
     Credits = job.credits if accepted else 0.
@@ -157,6 +173,12 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict):
     db: Session = SessionWork()
     try:
         lease = db.query(JobLease).filter(and_(JobLease.lease_id==lease_id, JobLease.job_id==job_id, JobLease.device_id==device_id, JobLease.active==True)).first()
+        # device signature required (prevents impersonation)
+        d = _device_get_or_create(db, device_id)
+        if not (d.pubkey_b64 and device_msg and device_sig_b64):
+            raise HTTPException(status_code=400, detail="device_sig_required")
+        if not _verify_device_sig(d.pubkey_b64, device_msg, device_sig_b64):
+            raise HTTPException(status_code=400, detail="device_sig_invalid")
         if not lease:
             raise HTTPException(status_code=400, detail="invalid_lease")
         if lease.expires_at < _now():
@@ -268,7 +290,7 @@ def submit_job(device_id: str, lease_id: str, job_id: str, output: dict):
 
 
 @router.post("/devices/register")
-def device_register(device_id: str, platform: str = "unknown", has_lean: bool = False, ram_mb: int = 0, disk_mb: int = 0, topics: str = "", meta: dict | None = None):
+def device_register(device_id: str, platform: str = "unknown", has_lean: bool = False, ram_mb: int = 0, disk_mb: int = 0, topics: str = "", pubkey_b64: str = "", meta: dict | None = None):
     """
     Device announces capabilities + preferred topics.
     topics: csv, e.g. "algebra,nt,topology"
@@ -281,6 +303,8 @@ def device_register(device_id: str, platform: str = "unknown", has_lean: bool = 
         d.ram_mb = int(ram_mb)
         d.disk_mb = int(disk_mb)
         d.topics_csv = _csv_norm(topics)
+        if pubkey_b64.strip():
+            d.pubkey_b64 = pubkey_b64.strip()
         d.meta_json = _canon(meta or {})
         d.last_seen_at = _now()
         db.add(d); db.commit()
