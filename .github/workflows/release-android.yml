@@ -1,0 +1,63 @@
+name: release-android
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Decode Android keystore (from secrets)
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd clients/gmf_mobile_flutter
+          mkdir -p android/app/keystore
+          echo "$ANDROID_KEYSTORE_B64" | base64 -d > android/app/keystore/upload-keystore.jks
+
+          cat > android/key.properties <<EOF
+storePassword=$ANDROID_KEYSTORE_PASSWORD
+keyPassword=$ANDROID_KEY_PASSWORD
+keyAlias=$ANDROID_KEY_ALIAS
+storeFile=app/keystore/upload-keystore.jks
+EOF
+
+      - name: Build signed release APK
+        shell: bash
+        run: |
+          cd clients/gmf_mobile_flutter
+          flutter pub get
+          flutter build apk --release
+          ls -lh build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Stage APK into releases/android + sha256
+        shell: bash
+        run: |
+          cd /home/runner/work/${{ github.event.repository.name }}/${{ github.event.repository.name }}
+          mkdir -p releases/android
+          cp -f clients/gmf_mobile_flutter/build/app/outputs/flutter-apk/app-release.apk releases/android/latest.apk
+          ./scripts/release/sha256_file.sh releases/android/latest.apk releases/android/latest.apk.sha256
+          ls -lh releases/android/latest.apk releases/android/latest.apk.sha256
+
+      - name: Commit APK back to main (for GitHub Pages)
+        shell: bash
+        run: |
+          git config user.name "gmf-bot"
+          git config user.email "gmf-bot@users.noreply.github.com"
+          git add releases/android/latest.apk releases/android/latest.apk.sha256
+          git commit -m "release: publish android latest.apk for ${GITHUB_REF_NAME}" || true
+          git push origin HEAD:main || true
