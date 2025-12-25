@@ -1,0 +1,9 @@
+{
+  "_comment": "Optional mapping device_id -> public_handle. Safe to publish if you want.",
+  "devices": {
+    "example_device_id_hex": {
+      "handle": "@alice",
+      "publish": true
+    }
+  }
+}
