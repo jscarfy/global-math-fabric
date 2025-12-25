@@ -654,3 +654,64 @@ pub async fn run_report_verify(relay_base: &str, params: &Value) -> Result<Value
         "relay_base_url": relay_base
     }))
 }
+
+
+pub async fn run_canonical_export_verify(relay_base: &str, params: &Value) -> Result<Value> {
+    let rk = params.get("report_kind").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing report_kind"))?;
+    let pid = params.get("period_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing period_id"))?;
+
+    let base = relay_base.trim_end_matches('/');
+    let url = if rk == "monthly" {
+        format!("{}/v1/reports/monthly/canonical_export/{}", base, pid)
+    } else if rk == "yearly" {
+        format!("{}/v1/reports/yearly/canonical_export/{}", base, pid)
+    } else {
+        return Err(anyhow!("bad report_kind"));
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PAGE_TIMEOUT_SECS))
+        .build()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("canonical_export fetch failed: {}", resp.status()));
+    }
+    let txt = resp.text().await?;
+    let env: serde_json::Value = serde_json::from_str(&txt)?;
+
+    // offline-style verify in-process
+    let payload = env.get("canonical_export_payload").ok_or_else(|| anyhow!("missing canonical_export_payload"))?;
+    let pk_b64 = env.get("server_pubkey_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_pubkey_b64"))?;
+    let sig_b64 = env.get("server_sig_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_sig_b64"))?;
+
+    let pk_bytes = B64.decode(pk_b64)?;
+    let pk = VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| anyhow!("bad pk bytes"))?)
+        .map_err(|_| anyhow!("bad pk"))?;
+    let sig_bytes = B64.decode(sig_b64)?;
+    let sig = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| anyhow!("bad sig bytes"))?);
+
+    let canon = canonical_json_bytes_local(payload);
+    let msg = Sha256::digest(&canon);
+    let sig_ok = pk.verify(&msg, &sig).is_ok();
+
+    // recompute export_rollup on payload without rollup
+    let mut p2 = payload.clone();
+    if let Some(obj) = p2.as_object_mut() { obj.remove("rollup"); }
+    let canon2 = canonical_json_bytes_local(&p2);
+    let roll = Sha256::digest(&canon2);
+    let recomputed = hex::encode(roll);
+
+    let got = payload.get("rollup").and_then(|r| r.get("export_rollup_sha256")).and_then(|v| v.as_str()).unwrap_or("");
+    let roll_ok = got == recomputed;
+
+    Ok(serde_json::json!({
+        "ok": sig_ok && roll_ok,
+        "exit_code": if sig_ok && roll_ok { 0 } else { 2 },
+        "report_kind": rk,
+        "period_id": pid,
+        "sig_ok": sig_ok,
+        "export_rollup_sha256": got,
+        "recomputed_export_rollup_sha256": recomputed,
+        "rollup_matches": roll_ok
+    }))
+}
