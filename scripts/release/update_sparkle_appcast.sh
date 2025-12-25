@@ -40,8 +40,9 @@ echo "${SPARKLE_ED25519_PRIVKEY_B64}" | base64 -d > "$KEYFILE"
 # generate_appcast writes feed based on SUFeedURL inside archive metadata;
 # download-url-prefix makes item URLs point to Pages.
 "$APPCAST_TOOL" "$(dirname "$DMG")" \
-  --download-url-prefix "${PAGES_BASE}/releases/macos/" \
-  --ed-key-file "$KEYFILE"
+  --download-url-prefix "/releases/macos/" \
+  --release-notes-url-prefix "/releases/RELEASE_NOTES/" \
+  --ed-key-file ""
 
 rm -f "$KEYFILE"
 
