@@ -472,6 +472,11 @@ pub async fn run_final_verify(relay_base: &str, params: &Value) -> Result<Value>
     let final_env = fetch_final_json(relay_base, date).await?;
 
     let sig_ok = verify_final_snapshot_sig(&final_env)?;
+
+    let final_ssr_sha256 = final_env
+        .get("final_payload").and_then(|p| p.get("ssr_sha256"))
+        .and_then(|v| v.as_str()).map(|s| s.to_string());
+
     let pk_b64 = final_env.get("server_pubkey_b64").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     let canonical_pk = read_canonical_pubkey_b64();
@@ -492,6 +497,7 @@ pub async fn run_final_verify(relay_base: &str, params: &Value) -> Result<Value>
         "exit_code": if sig_ok && pk_match.unwrap_or(true) { 0 } else { 2 },
         "date": date,
         "final_sig_ok": sig_ok,
+        "final_ssr_sha256": final_ssr_sha256,
         "server_pubkey_b64": pk_b64,
         "canonical_pubkey_b64": canonical_pk,
         "pubkey_matches_canonical": pk_match,
