@@ -1,25 +1,22 @@
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer};
 use rand::rngs::OsRng;
 use serde_json::Value;
-use std::{fs, path::PathBuf, thread, time::Duration};
+use std::{fs, path::PathBuf, thread, time::Duration, process::Command};
 
 use gmf_receipts::{jcs_canonicalize, sha256, sha256_hex};
-
-use num_bigint::BigUint;
-use num_traits::{One, Zero};
+use tempfile::tempdir;
 
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long)]
-    relay: String, // e.g. http://host:8787
+    relay: String,
 
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 10)]
     loop_seconds: u64,
 
-    /// safety caps (宣告在 consent caps；伺服端可記錄/未來可強制)
     #[arg(long, default_value_t = 20)]
     max_cpu_percent: u32,
 
@@ -28,6 +25,9 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     only_while_charging: bool,
+
+    #[arg(long, default_value = "leanprovercommunity/lean:latest")]
+    lean_image: String,
 }
 
 fn key_dir() -> PathBuf { dirs::home_dir().unwrap().join(".gmf") }
@@ -45,7 +45,7 @@ fn load_or_create_seed_b64() -> anyhow::Result<String> {
 
 fn pubkey_b64_from_seed(seed_b64: &str) -> anyhow::Result<String> {
     let seed = B64.decode(seed_b64)?;
-    let sk = SigningKey::from_bytes(&seed.try_into().map_err(|_| anyhow::anyhow!("bad seed"))?);
+    let sk = SigningKey::from_bytes(&seed.try_into().map_err(|_| anyhow!("bad seed"))?);
     let pk = VerifyingKey::from(&sk);
     Ok(B64.encode(pk.to_bytes()))
 }
@@ -57,7 +57,7 @@ fn device_id_from_pubkey_b64(pub_b64: &str) -> anyhow::Result<String> {
 
 fn sign_payload_b64(seed_b64: &str, payload: &Value) -> anyhow::Result<String> {
     let seed = B64.decode(seed_b64)?;
-    let sk = SigningKey::from_bytes(&seed.try_into().map_err(|_| anyhow::anyhow!("bad seed"))?);
+    let sk = SigningKey::from_bytes(&seed.try_into().map_err(|_| anyhow!("bad seed"))?);
     let canon = jcs_canonicalize(payload);
     let msg = sha256(&canon);
     let sig: Signature = sk.sign(&msg);
@@ -77,71 +77,80 @@ fn make_consent(device_id: &str, caps: &Value) -> Value {
     })
 }
 
-fn fib_fast_doubling(n: u64) -> BigUint {
-    fn fd(n: u64) -> (BigUint, BigUint) {
-        if n == 0 { return (BigUint::zero(), BigUint::one()); }
-        let (a, b) = fd(n >> 1);
-        let two_b = &b << 1;
-        let two_b_minus_a = if two_b >= a { two_b - &a } else { BigUint::zero() };
-        let c = &a * &two_b_minus_a;
-        let d = &a * &a + &b * &b;
-        if (n & 1) == 0 { (c, d) } else { (d.clone(), c + d) }
-    }
-    fd(n).0
+fn run_cmd(mut cmd: Command) -> anyhow::Result<(i32, String)> {
+    let out = cmd.output().context("spawn command")?;
+    let code = out.status.code().unwrap_or(1);
+    let mut s = String::new();
+    s.push_str(&String::from_utf8_lossy(&out.stdout));
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((code, s))
 }
 
-fn mod_pow(mut a: u128, mut d: u128, n: u128) -> u128 {
-    let mut r: u128 = 1;
-    a %= n;
-    while d > 0 {
-        if d & 1 == 1 { r = (r * a) % n; }
-        a = (a * a) % n;
-        d >>= 1;
-    }
-    r
-}
+fn solve_lean_check(task: &Value, lean_image: &str) -> anyhow::Result<(bool, i32)> {
+    let params = task.get("params").context("missing params")?;
+    let git_url = params.get("git_url").and_then(|v| v.as_str()).context("missing git_url")?;
+    let rev = params.get("rev").and_then(|v| v.as_str()).context("missing rev")?;
+    let subdir = params.get("subdir").and_then(|v| v.as_str()).unwrap_or("");
+    let use_cache = params.get("use_mathlib_cache").and_then(|v| v.as_bool()).unwrap_or(true);
 
-fn is_prime_u64(n: u64) -> bool {
-    if n < 2 { return false; }
-    const SMALL: [u64; 12] = [2,3,5,7,11,13,17,19,23,29,31,37];
-    for &p in SMALL.iter() {
-        if n == p { return true; }
-        if n % p == 0 { return false; }
+    // cmd defaults to ["lake","build"]
+    let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned().unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
+    let cmd_vec: Vec<String> = cmd_arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+    if cmd_vec.is_empty() { return Err(anyhow!("empty cmd")); }
+
+    // clone into temp dir
+    let dir = tempdir()?;
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo)?;
+
+    // minimal fetch of specific commit
+    run_cmd(Command::new("git").arg("init").current_dir(&repo))?;
+    run_cmd(Command::new("git").args(["remote","add","origin", git_url]).current_dir(&repo))?;
+    run_cmd(Command::new("git").args(["fetch","--depth","1","origin", rev]).current_dir(&repo))?;
+    run_cmd(Command::new("git").args(["checkout","FETCH_HEAD"]).current_dir(&repo))?;
+
+    let workdir = if subdir.is_empty() { repo.clone() } else { repo.join(subdir) };
+    if !workdir.exists() {
+        return Err(anyhow!("subdir does not exist: {}", workdir.display()));
     }
-    let mut d = (n - 1) as u128;
-    let mut s = 0u32;
-    while (d & 1) == 0 { d >>= 1; s += 1; }
-    let n128 = n as u128;
-    let bases: [u64; 7] = [2, 325, 9375, 28178, 450775, 9780504, 1795265022];
-    'outer: for &a0 in bases.iter() {
-        let a = (a0 as u128) % n128;
-        if a == 0 { continue; }
-        let mut x = mod_pow(a, d, n128);
-        if x == 1 || x == n128 - 1 { continue; }
-        for _ in 1..s {
-            x = (x * x) % n128;
-            if x == n128 - 1 { continue 'outer; }
-        }
-        return false;
+
+    // build command inside Docker
+    // - mount repo, run in /workspace/<subdir>
+    // - optionally run lake exe cache get first (mathlib speed)
+    let mut bash = String::new();
+    if use_cache {
+        bash.push_str("lake exe cache get && ");
     }
-    true
+    bash.push_str(&cmd_vec.join(" "));
+
+    // docker run
+    let (code, _log) = run_cmd(
+        Command::new("docker")
+            .arg("run").arg("--rm")
+            .arg("-v").arg(format!("{}:/workspace", repo.display()))
+            .arg("-w").arg(format!("/workspace/{}", subdir))
+            .arg(lean_image)
+            .arg("bash").arg("-lc").arg(bash)
+    )?;
+
+    Ok((code == 0, code))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
     let seed_b64 = load_or_create_seed_b64()?;
     let pub_b64 = pubkey_b64_from_seed(&seed_b64)?;
     let device_id = device_id_from_pubkey_b64(&pub_b64)?;
     eprintln!("GMF worker device_id={device_id}");
 
+    // consent token JSON string (device signed)
     let caps = serde_json::json!({
         "max_cpu_percent": args.max_cpu_percent,
         "wifi_only": args.wifi_only,
         "only_while_charging": args.only_while_charging
     });
-
-    // consent token JSON string (device signed)
     let mut consent = make_consent(&device_id, &caps);
     let payload = consent.get("consent_payload").unwrap().clone();
     let sig_b64 = sign_payload_b64(&seed_b64, &payload)?;
@@ -151,10 +160,8 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
 
     loop {
-        // -------- pull task --------
-        let pull_payload = serde_json::json!({
-            "requested_at": chrono::Utc::now().to_rfc3339()
-        });
+        // pull
+        let pull_payload = serde_json::json!({ "requested_at": chrono::Utc::now().to_rfc3339() });
         let pull_sig = sign_payload_b64(&seed_b64, &pull_payload)?;
         let pull_body = serde_json::json!({
             "protocol": "gmf/task_pull/v1",
@@ -166,41 +173,28 @@ async fn main() -> anyhow::Result<()> {
 
         let pull_url = format!("{}/v1/tasks/pull", args.relay.trim_end_matches('/'));
         let pull_res = client.post(pull_url).json(&pull_body).send().await;
+
         let pull_json: Value = match pull_res {
             Ok(r) if r.status().is_success() => r.json().await.unwrap_or(Value::Null),
-            Ok(r) => {
-                eprintln!("pull rejected: {}", r.status());
-                thread::sleep(Duration::from_secs(args.loop_seconds));
-                continue;
-            }
-            Err(e) => {
-                eprintln!("pull error: {e}");
-                thread::sleep(Duration::from_secs(args.loop_seconds));
-                continue;
-            }
+            Ok(_) => { thread::sleep(Duration::from_secs(args.loop_seconds)); continue; }
+            Err(_) => { thread::sleep(Duration::from_secs(args.loop_seconds)); continue; }
         };
 
         let task = pull_json.get("task").cloned().unwrap_or(Value::Null);
         if task.is_null() {
-            eprintln!("no task; sleeping…");
+            eprintln!("no task; sleep…");
             thread::sleep(Duration::from_secs(args.loop_seconds));
             continue;
         }
 
         let task_id = task.get("task_id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-        let kind = task.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let params = task.get("params").cloned().unwrap_or(Value::Null);
+        let kind = task.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
-        // -------- solve --------
-        let result: Value = match kind {
-            "fibonacci" => {
-                let n = params.get("n").and_then(|v| v.as_u64()).context("missing n")?;
-                let v = fib_fast_doubling(n).to_str_radix(10);
-                Value::String(v)
-            }
-            "is_prime_64" => {
-                let x = params.get("x").and_then(|v| v.as_u64()).context("missing x")?;
-                Value::Bool(is_prime_u64(x))
+        // solve -> result_core must be deterministic-ish; keep minimal fields
+        let (ok, exit_code) = match kind.as_str() {
+            "lean_check" => {
+                eprintln!("solve lean_check {task_id} …");
+                solve_lean_check(&task, &args.lean_image).unwrap_or((false, 1))
             }
             _ => {
                 eprintln!("unknown kind={kind}; skipping");
@@ -209,10 +203,12 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        // -------- submit --------
+        let result_core = serde_json::json!({ "ok": ok, "exit_code": exit_code });
+
+        // submit
         let submit_payload = serde_json::json!({
             "task_id": task_id,
-            "result": result,
+            "result_core": result_core,
             "completed_at": chrono::Utc::now().to_rfc3339()
         });
         let submit_sig = sign_payload_b64(&seed_b64, &submit_payload)?;
@@ -231,12 +227,11 @@ async fn main() -> anyhow::Result<()> {
             Ok(r) if r.status().is_success() => {
                 let ssr: Value = r.json().await.unwrap_or(Value::Null);
                 let delta = ssr.pointer("/receipt_payload/credits_delta_micro").and_then(|x| x.as_i64()).unwrap_or(0);
-                let task_kind = ssr.pointer("/receipt_payload/task_kind").and_then(|x| x.as_str()).unwrap_or("?");
-                eprintln!("SSR ok: kind={task_kind} +{delta} microcredits");
+                eprintln!("SSR ok: +{delta} microcredits");
             }
             Ok(r) => {
                 let t = r.text().await.unwrap_or_default();
-                eprintln!("submit rejected: {} {}", r.status(), t);
+                eprintln!("submit: {} {}", r.status(), t);
             }
             Err(e) => eprintln!("submit error: {e}"),
         }
