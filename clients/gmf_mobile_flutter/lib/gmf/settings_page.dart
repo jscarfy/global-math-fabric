@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'consent.dart';
 import 'platform_runner.dart';
+import 'device_register.dart';
 
 class GmfSettingsPage extends StatefulWidget {
   const GmfSettingsPage({super.key});
@@ -51,6 +52,11 @@ class _GmfSettingsPageState extends State<GmfSettingsPage> {
     if (!_consented && v) return;
     if (v) {
       await _requestAndroidNotificationPermissionIfNeeded();
+      // ensure device is registered to this account before starting background
+      // TODO: replace baseUrl/accountId with your real config/account system
+      final baseUrl = const String.fromEnvironment('GMF_BASE_URL', defaultValue: 'http://10.0.2.2:8080');
+      final accountId = const String.fromEnvironment('GMF_ACCOUNT_ID', defaultValue: 'demo');
+      await DeviceRegister.ensureRegistered(baseUrl: baseUrl, accountId: accountId);
       await PlatformRunner.startBackground();
     } else {
       await PlatformRunner.stopBackground();
