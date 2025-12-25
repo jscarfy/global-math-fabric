@@ -34,12 +34,14 @@ jobs:
           cd clients/gmf_mobile_flutter
           flutter pub get
           flutter build windows --release
-          cd build/windows/x64/runner/Release
-          powershell -Command "Compress-Archive -Path * -DestinationPath ../../../../../../../../dist/updates/gmf-windows-x64.zip -Force"
-      - uses: actions/upload-artifact@v4
+          dart pub get
+          dart run msix:create
+          mkdir -p ../../dist/updates
+          powershell -Command "Copy-Item -Force -Recurse build\windows\runner\Release\*.msix ..\..\dist\updates\gmf-windows-x64.msix"
+      - uses: actions/upload-artifact
         with:
           name: windows
-          path: dist/updates/gmf-windows-x64.zip
+          path: dist/updates/gmf-windows-x64.msix
 
   macos:
     runs-on: macos-latest
