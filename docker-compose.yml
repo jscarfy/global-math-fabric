@@ -33,3 +33,13 @@ services:
 
 volumes:
   gmf_pg:
+
+
+  verifier:
+    build:
+      context: ./verifier
+    environment:
+      - GMF_API=http://api:8000
+      - GMF_VERIFIER_ID=verifier-1
+    depends_on:
+      - api

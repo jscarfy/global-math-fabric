@@ -1,0 +1,14 @@
+{
+  "trusted_keys": [
+    {
+      "key_id": "task-dev",
+      "alg": "ed25519",
+      "public_key_raw_b64": "kKNy7sv17SBI/XnKmTO3uDGxSkLlAsfVgNovh7AaK/8="
+    },
+    {
+      "key_id": "receipt-dev",
+      "alg": "ed25519",
+      "public_key_raw_b64": "Z7MsBmTsrNI4IVcbrXUvLs+tMa0jhRmKmsnUfry4nGs="
+    }
+  ]
+}
