@@ -48,13 +48,18 @@ EOF
           ls -lh build/app/outputs/flutter-apk/app-release.apk
           ls -lh build/app/outputs/bundle/release/app-release.aab
 
+      - name: Generate Play 'What's new' changelog (versionCode = run_number)
+        run: |
+          ./scripts/release/write_play_changelog_from_tag.sh "${GITHUB_REF_NAME}" "${GITHUB_RUN_NUMBER}" en-US clients/gmf_mobile_flutter/android/fastlane/metadata/android
+          ls -lh clients/gmf_mobile_flutter/android/fastlane/metadata/android/en-US/changelogs
+
       - name: Stage APK into releases/android + sha256 (Pages sideload)
         run: |
           mkdir -p releases/android
           cp -f clients/gmf_mobile_flutter/build/app/outputs/flutter-apk/app-release.apk releases/android/latest.apk
           ./scripts/release/sha256_file.sh releases/android/latest.apk releases/android/latest.apk.sha256
 
-      - name: Upload AAB to Google Play internal track (fastlane supply)
+      - name: Upload AAB to Google Play internal track (with changelog)
         env:
           PLAY_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON_B64 }}
           PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}
@@ -64,15 +69,52 @@ EOF
           echo "$PLAY_SERVICE_ACCOUNT_JSON_B64" | base64 -d > /tmp/gmf_play/service_account.json
 
           bundle install --path vendor/bundle
+
+          AAB_PATH="$(cd .. && pwd)/build/app/outputs/bundle/release/app-release.aab"
+          PLAY_JSON_KEY_FILE="/tmp/gmf_play/service_account.json"
+          METADATA_PATH="$(pwd)/fastlane/metadata/android"
+          export AAB_PATH PACKAGE_NAME PLAY_JSON_KEY_FILE METADATA_PATH
+
+          bundle exec fastlane android internal
+
+      - name: Upload to Internal App Sharing (IAS) + save URL into releases/
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON_B64 }}
+          PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}
+        run: |
+          cd clients/gmf_mobile_flutter/android
+          mkdir -p /tmp/gmf_play
+          echo "$PLAY_SERVICE_ACCOUNT_JSON_B64" | base64 -d > /tmp/gmf_play/service_account.json
+
+          bundle install --path vendor/bundle
+
           AAB_PATH="$(cd .. && pwd)/build/app/outputs/bundle/release/app-release.aab"
           PLAY_JSON_KEY_FILE="/tmp/gmf_play/service_account.json"
           export AAB_PATH PACKAGE_NAME PLAY_JSON_KEY_FILE
-          bundle exec fastlane android internal
 
-      - name: Commit APK + sha256 back to main (for GitHub Pages)
+          # Run IAS lane, parse IAS_URL=... line
+          OUT="$(bundle exec fastlane android ias || true)"
+          echo "$OUT"
+
+          IAS_URL="$(echo "$OUT" | sed -n 's/.*IAS_URL=\(https:\/\/play\.google\.com\/apps\/test\/[^ ]*\).*/\1/p' | tail -n 1 || true)"
+          if [ -n "$IAS_URL" ]; then
+            cd ../../../..
+            mkdir -p releases/android
+            echo "$IAS_URL" > releases/android/internal_app_sharing_url.txt
+            echo "Saved IAS URL to releases/android/internal_app_sharing_url.txt"
+          else
+            echo "WARNING: Could not parse IAS URL from fastlane output"
+          fi
+
+      - name: Commit artifacts back to main (Pages)
         run: |
           git config user.name "gmf-bot"
           git config user.email "gmf-bot@users.noreply.github.com"
-          git add releases/android/latest.apk releases/android/latest.apk.sha256 clients/gmf_mobile_flutter/pubspec.yaml
-          git commit -m "release: publish android apk + version bump for ${GITHUB_REF_NAME}" || true
+          git add \
+            releases/android/latest.apk \
+            releases/android/latest.apk.sha256 \
+            releases/android/internal_app_sharing_url.txt \
+            clients/gmf_mobile_flutter/pubspec.yaml \
+            clients/gmf_mobile_flutter/android/fastlane/metadata/android/en-US/changelogs/*.txt || true
+          git commit -m "release: android play+ias publish for ${GITHUB_REF_NAME}" || true
           git push origin HEAD:main || true
