@@ -3,6 +3,7 @@ import 'package:battery_plus/battery_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 
 import 'consent_store.dart';
+import 'runtime_status.dart';
 import 'account_store.dart';
 import 'resource_limits_store.dart';
 
@@ -28,14 +29,16 @@ class RuntimeGuard {
     // 1) consent
     final consent = await ConsentStore.hasConsent();
     if (!consent) {
-      return GuardDecision.block(GuardBlockReason.noConsent, "Consent missing");
+      await RuntimeStatus.set(GMFStatus.blockedNoConsent);
+    return GuardDecision.block(GuardBlockReason.noConsent, "Consent missing");
     }
 
     // 2) token/account must exist
     final token = await AccountStore.getToken();
     final acct = await AccountStore.getAccountId();
     if (token == null || token.isEmpty || acct == null || acct.isEmpty) {
-      return GuardDecision.block(GuardBlockReason.noToken, "Account token missing");
+      await RuntimeStatus.set(GMFStatus.blockedNoToken);
+    return GuardDecision.block(GuardBlockReason.noToken, "Account token missing");
     }
 
     // 3) limits
@@ -47,6 +50,7 @@ class RuntimeGuard {
         final state = await _battery.batteryState;
         final charging = (state == BatteryState.charging) || (state == BatteryState.full);
         if (!charging) {
+          await RuntimeStatus.set(GMFStatus.blockedNotCharging);
           return GuardDecision.block(GuardBlockReason.notCharging, "Not charging (charging-only enabled)");
         }
       } catch (_) {
