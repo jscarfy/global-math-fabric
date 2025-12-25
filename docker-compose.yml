@@ -74,6 +74,8 @@ volumes:
       - GMF_LEDGER_JSONL=ledger/receipts/receipts.jsonl
       - GMF_MERKLE_DB=ledger/cache/merkle_nodes.sqlite
       - GMF_PREWARM_BUDGET=200000
+      - GMF_CHECKPOINT_PREWARM_ENABLED=1
+      - GMF_CHECKPOINT_PREWARM_BUDGET=50000
       - GMF_LEDGER_CHECKPOINTS_DIR=ledger/checkpoints
       - GMF_LEDGER_PENDING_DIR=ledger/pending_checkpoints
       - GMF_CREDITS_BASE_HEAVY=5

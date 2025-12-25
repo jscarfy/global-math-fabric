@@ -891,13 +891,33 @@ def ledger_tail(limit: int = 20):
 
 
 @app.get("/ledger/checkpoint/pending")
-def ledger_checkpoint_pending():
+def ledger_checkpoint_pending(prewarm_budget_nodes: int | None = None):
     """
     Server returns a pending checkpoint request (no signatures).
-    Guardians sign msg offline and POST /ledger/checkpoint/submit.
+    Hardening: prewarm Merkle cache (budgeted) before creating pending checkpoint,
+    so computing root is stable and won't scan/lag.
     """
+    enabled = os.environ.get("GMF_CHECKPOINT_PREWARM_ENABLED", "1") != "0"
+    budget = prewarm_budget_nodes
+    if budget is None:
+        try:
+            budget = int(os.environ.get("GMF_CHECKPOINT_PREWARM_BUDGET", "50000"))
+        except Exception:
+            budget = 50000
+
+    prewarm_res = None
+    if enabled:
+        try:
+            # prewarm internal nodes up to root level for current ledger length
+            prewarm_res = ledger_cache_prewarm(budget_nodes=int(budget))
+        except Exception:
+            prewarm_res = {"ok": False}
+
     req = checkpointing.create_pending_checkpoint(GMF_GOV["rules_sha256"])
+    if prewarm_res is not None:
+        req["prewarm"] = prewarm_res
     return req
+
 
 @app.post("/ledger/checkpoint/submit")
 def ledger_checkpoint_submit(checkpoint: dict):
@@ -1052,3 +1072,35 @@ def ledger_cache_prewarm(budget_nodes: int = 200000):
     upto = root_level(n)
     res = mc.prewarm(n, upto_level=upto, budget_nodes=int(budget_nodes))
     return {"ok": True, "n_leaves": int(n), "upto_level": int(upto), "res": res, "cached_nodes": mc.count_nodes()}
+
+
+@app.get("/ledger/checkpoint/status")
+def ledger_checkpoint_status():
+    """
+    Returns how far the latest signed checkpoint lags behind the current ledger head.
+    """
+    head_root, head_n = checkpointing.current_ledger_root_and_len()
+    cp = checkpointing.latest_checkpoint()
+    if not cp:
+        return {
+            "ok": True,
+            "has_checkpoint": False,
+            "head_entries": int(head_n),
+            "head_root_sha256": head_root,
+            "checkpoint_entries": 0,
+            "checkpoint_root_sha256": None,
+            "lag_entries": int(head_n),
+        }
+
+    cpn = int(cp.get("entries") or 0)
+    cpr = str(cp.get("ledger_root_sha256") or "")
+    return {
+        "ok": True,
+        "has_checkpoint": True,
+        "head_entries": int(head_n),
+        "head_root_sha256": head_root,
+        "checkpoint_entries": cpn,
+        "checkpoint_root_sha256": cpr,
+        "lag_entries": int(head_n - cpn),
+        "checkpoint": cp
+    }
