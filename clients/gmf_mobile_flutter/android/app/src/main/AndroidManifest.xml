@@ -1,9 +1,19 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.WAKE_LOCK" />
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS" /> xmlns:android="http://schemas.android.com/apk/res/android">
     <application
         android:label="gmf_mobile_flutter"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
-        <activity
+        
+
+        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+<activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
