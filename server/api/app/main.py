@@ -22,6 +22,10 @@ from app.schemas.receipt import ReceiptsResponse, ReceiptRow
 from app.schemas.device import DeviceRegisterRequest, DeviceRegisterResponse, DeviceChallengeResponse, HeartbeatRequest, HeartbeatResponse
 from app.schemas.attest import DeviceAttestRequest, DeviceAttestResponse
 from app.crypto.receipt import sign_receipt, now_iso
+from app.crypto.governance import load_governance_or_die
+from app.crypto import ledger as ledger_mod
+from app.crypto import checkpointing
+from app.crypto import merkle as merkle_mod
 from app.schemas.receipt import ReceiptEnvelope
 from app.schemas.replay import ReplayQueueResponse, ReplayQueueItem, ReplayReportRequest, ReplayReportResponse
 from app.security.signing import load_truststore, verify_bundle_ed25519
@@ -30,6 +34,10 @@ from app.security.device_auth import verify_ed25519_signature
 from app.security.risk import decay_risk, fingerprint_hash, result_weight_from_risk, reward_mult_from_risk, _geti
 
 app = FastAPI(title="Global Math Fabric API")
+
+# ---- Governance (fail-fast) ----
+GMF_GOV = load_governance_or_die()
+# -------------------------------
 
 @app.on_event("startup")
 def _startup():
@@ -859,3 +867,101 @@ def verify_receipt_endpoint(env: ReceiptEnvelope):
             # keep ok as-is, but no payload
             payload = None
     return {"ok": ok, "key_id": env.key_id, "payload": payload}
+
+
+@app.get("/governance/rules/current")
+def governance_rules_current():
+    return {
+        "rules_version": GMF_GOV["rules_version"],
+        "rules_sha256": GMF_GOV["rules_sha256"],
+        "guardian_set_id": GMF_GOV["guardian_set_id"],
+        "rules": GMF_GOV["rules"],
+        "sigset": GMF_GOV["sigset"],
+        "guardian_set": GMF_GOV["guardian_set"],
+    }
+
+@app.get("/ledger/root")
+def ledger_root():
+    root, n = ledger_mod.current_root_and_len()
+    return {"ledger_root_sha256": root, "entries": n}
+
+@app.get("/ledger/receipts/tail")
+def ledger_tail(limit: int = 20):
+    return {"limit": int(limit), "lines": ledger_mod.tail(limit)}
+
+
+@app.get("/ledger/checkpoint/pending")
+def ledger_checkpoint_pending():
+    """
+    Server returns a pending checkpoint request (no signatures).
+    Guardians sign msg offline and POST /ledger/checkpoint/submit.
+    """
+    req = checkpointing.create_pending_checkpoint(GMF_GOV["rules_sha256"])
+    return req
+
+@app.post("/ledger/checkpoint/submit")
+def ledger_checkpoint_submit(checkpoint: dict):
+    """
+    Accept a threshold-signed checkpoint JSON.
+    """
+    res = checkpointing.accept_checkpoint(checkpoint, GMF_GOV["rules_sha256"])
+    return {"ok": True, **res}
+
+@app.get("/ledger/checkpoints/latest")
+def ledger_checkpoints_latest():
+    cp = checkpointing.latest_checkpoint()
+    return {"ok": bool(cp), "checkpoint": cp}
+
+@app.get("/ledger/receipt/proof")
+def ledger_receipt_proof(receipt_id: str):
+    """
+    Return inclusion proof for receipt envelope identified by receipt_id
+    (searching ledger jsonl lines; MVP O(n)).
+    Proof is relative to latest checkpoint (if exists), otherwise to current ledger head.
+    """
+    # load ledger lines
+    lines = ledger_mod.tail(2000000000)  # read all (ledger_mod.tail is limited; we need full)
+    # fallback: use checkpointing.read_all_lines which returns bytes
+    raw_lines = checkpointing.read_all_lines()
+
+    # find the line index containing receipt_id (best-effort string match)
+    idx0 = -1
+    line_bytes = None
+    for i, b in enumerate(raw_lines):
+        if receipt_id.encode("utf-8") in b:
+            idx0 = i
+            line_bytes = b
+            break
+    if idx0 < 0:
+        return {"ok": False, "error": "receipt_id_not_found"}
+
+    # choose anchor: latest checkpoint if it covers this index; else current head
+    cp = checkpointing.latest_checkpoint()
+    if cp:
+        n = int(cp.get("entries") or 0)
+        root = str(cp.get("ledger_root_sha256"))
+        if idx0 >= n:
+            # not yet checkpointed -> use current head
+            root, n = checkpointing.current_ledger_root_and_len()
+            cp = None
+        else:
+            # compute proof from first n leaves
+            raw_lines = raw_lines[:n]
+    else:
+        root, n = checkpointing.current_ledger_root_and_len()
+
+    # leaf hashes
+    leaf_hashes = [merkle_mod._h(x) for x in raw_lines]
+    proof = merkle_mod.build_merkle_proof(leaf_hashes, idx0)
+
+    return {
+        "ok": True,
+        "receipt_id": receipt_id,
+        "index0": idx0,
+        "entries": n,
+        "anchor": ("checkpoint" if cp else "head"),
+        "ledger_root_sha256": root,
+        "leaf_sha256": merkle_mod._h(line_bytes).hex(),
+        "proof": proof,
+        "checkpoint": cp
+    }

@@ -7,6 +7,8 @@ services:
       POSTGRES_DB: gmf
     ports: ["5432:5432"]
     volumes:
+      - ./governance:/app/governance
+      - ./ledger:/app/ledger
       - gmf_pg:/var/lib/postgresql/data
 
   redis:
@@ -66,6 +68,12 @@ volumes:
       - GMF_HEAVY_PROOF_AUDIT_RATE=0.01
       - GMF_HEAVY_PROOF_MAX_ITERS_VERIFY=2000000
       - GMF_CREDITS_BASE_LIGHT=1
+      - GMF_RULES_PATH=governance/rules/v1.json
+      - GMF_RULES_SIGSET_PATH=governance/rules/v1.sigset.json
+      - GMF_GUARDIAN_SET_PATH=governance/signers/guardian_set_v1.json
+      - GMF_LEDGER_JSONL=ledger/receipts/receipts.jsonl
+      - GMF_LEDGER_CHECKPOINTS_DIR=ledger/checkpoints
+      - GMF_LEDGER_PENDING_DIR=ledger/pending_checkpoints
       - GMF_CREDITS_BASE_HEAVY=5
       - GMF_CREDITS_MAX_PER_INSTANCE=200
       - GMF_CREDITS_RATE_SHA256_PER_1M=1.0
