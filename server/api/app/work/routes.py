@@ -6,6 +6,7 @@ import base64
 import hashlib
 from app.work.db.models import LeaseUse, LeaseChallenge
 import os
+from app.credits.ledger import record_receipt_v1
 import json
 from pathlib import Path
 import os, json, uuid, hashlib, datetime, base64
@@ -165,6 +166,50 @@ def pull_job(device_id: str, topics: str = ""):
         submitted_sig_spec = (sub.get('sig_spec_hash') or '').strip().lower()
         if not submitted_sig_spec:
             accepted = False; reason = 'sig_spec_hash_missing'; awarded_credits = 0
+
+        # --- Credits receipt (signed, append-only) ---
+        try:
+            if accepted and int(awarded_credits) > 0 and isinstance(job_input, dict):
+                policy_hash = str(os.environ.get("GMF_POLICY_HASH",""))
+                verifier_name = "server_verify_job_output_v1"
+                verifier_version = "v1"
+                verifier_digest_sha256 = hashlib.sha256(b"server_verify_job_output_v1:v1").hexdigest()
+
+                # best-effort gather ids
+                _job_id = str(job_input.get("seed_hex") or job_input.get("kind") or "job")
+                _lease_id = str(sub.get("lease_id") or lease.get("lease_id") or lease.get("id") or "lease")
+                _job_kind = str(job_input.get("kind") or "unknown")
+
+                device_pk = str(sub.get("device_pk_ed25519") or "")
+                device_sig = str(sub.get("device_sig") or sub.get("device_sig_over_submit_sha256") or "")
+
+                audit_rate = float((lease.get("audit_spec") or {}).get("rate", 0.0))
+                audit_chunk_size = int((lease.get("audit_spec") or {}).get("chunk_size", 0))
+                audit_idx0 = True
+
+                record_receipt_v1(
+                    policy_hash=policy_hash,
+                    verifier_name=verifier_name,
+                    verifier_version=verifier_version,
+                    verifier_digest_sha256=verifier_digest_sha256,
+                    job_id=_job_id,
+                    lease_id=_lease_id,
+                    job_kind=_job_kind,
+                    job_input_json=json.dumps(job_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+                    job_output_json=str(output),
+                    device_pk_ed25519=device_pk,
+                    device_sig_over_submit_sha256=device_sig,
+                    audit_rate=audit_rate,
+                    audit_chunk_size=audit_chunk_size,
+                    audit_sample_idx0_included=audit_idx0,
+                    awarded_credits=int(awarded_credits),
+                )
+        except Exception as _e:
+            # never fail submit due to ledger write; but keep logs
+            try:
+                print("credit receipt error:", _e)
+            except Exception:
+                pass
         elif submitted_sig_spec != str(GMF_SIG_SPEC_HASH).lower():
             accepted = False; reason = 'sig_spec_hash_mismatch'; awarded_credits = 0
         # device signature verification (anti-credit-theft)
