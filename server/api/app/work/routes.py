@@ -840,6 +840,8 @@ import random
 
 def _make_job_input_v1(topic: str) -> dict:
     # topic can select job families; default -> pow_v1
+    if topic == "rw":
+        return _make_rw_eq_job_v1()
     if topic == "poly":
         # simple identity: (x+y)^2 == x^2 + 2xy + y^2
         return {
@@ -954,4 +956,199 @@ def _verify_job_output_v1(job_input: dict, output_str: str) -> tuple[bool,str,in
         credits = min(1000, 10 + 2*len(lhs) + 2*len(rhs) + sum(sum(int(x) for x in (t.get("e") or [])) for t in lhs+rhs))
         return (True, "ok", int(credits))
 
+
+    if kind == "rw_eq_v1":
+        # output expected JSON with kind=rw_eq_v1_result
+        if ok_kind != "rw_eq_v1_result":
+            return (False, "rw_wrong_kind", 0)
+
+        start = job_input.get("start")
+        goal  = job_input.get("goal")
+        max_steps = int(job_input.get("max_steps", 0))
+        max_nodes = int(job_input.get("max_nodes", 0))
+        steps = out.get("steps") or []
+
+        # replay (apply rule at path)
+        def nodes(expr):
+            if not isinstance(expr, dict): return 0
+            t = expr.get("t")
+            if t in ("c","v"): return 1
+            if t in ("+","*"):
+                a = expr.get("a") or []
+                return 1 + sum(nodes(x) for x in a)
+            return 1
+
+        def canon_key(expr):
+            t = expr.get("t")
+            if t=="c": return f"c:{int(expr.get('v',0))}"
+            if t=="v": return f"v:{expr.get('n','')}"
+            if t in ("+","*"):
+                ks = [canon_key(x) for x in (expr.get("a") or [])]
+                ks.sort()
+                return f"{t}(" + ",".join(ks) + ")"
+            return "?"
+
+        def get_at(expr, path):
+            cur = expr
+            for i in path:
+                a = cur.get("a") or []
+                if int(i) < 0 or int(i) >= len(a): return None
+                cur = a[int(i)]
+            return cur
+
+        def set_at(expr, path, new_sub):
+            if not path: 
+                return new_sub
+            cur = expr
+            for i in path[:-1]:
+                a = cur.get("a") or []
+                cur = a[int(i)]
+            a = cur.get("a") or []
+            a[int(path[-1])] = new_sub
+            cur["a"] = a
+            return expr
+
+        def apply_rule(sub, rule):
+            t = sub.get("t")
+            if rule=="add_flatten" and t=="+":
+                outa=[]
+                changed=False
+                for x in (sub.get("a") or []):
+                    if isinstance(x, dict) and x.get("t")=="+": 
+                        outa.extend(x.get("a") or []); changed=True
+                    else:
+                        outa.append(x)
+                if changed: sub["a"]=outa
+                return changed
+
+            if rule=="mul_flatten" and t=="*":
+                outa=[]
+                changed=False
+                for x in (sub.get("a") or []):
+                    if isinstance(x, dict) and x.get("t")=="*": 
+                        outa.extend(x.get("a") or []); changed=True
+                    else:
+                        outa.append(x)
+                if changed: sub["a"]=outa
+                return changed
+
+            if rule=="add_sort" and t=="+":
+                a = sub.get("a") or []
+                before=[canon_key(x) for x in a]
+                a.sort(key=canon_key)
+                after=[canon_key(x) for x in a]
+                sub["a"]=a
+                return before!=after
+
+            if rule=="mul_sort" and t=="*":
+                a = sub.get("a") or []
+                before=[canon_key(x) for x in a]
+                a.sort(key=canon_key)
+                after=[canon_key(x) for x in a]
+                sub["a"]=a
+                return before!=after
+
+            if rule=="add_drop0" and t=="+":
+                a = [x for x in (sub.get("a") or []) if not (isinstance(x,dict) and x.get("t")=="c" and int(x.get("v",0))==0)]
+                if len(a)==0: return {"t":"c","v":0}
+                if len(a)==1: return a[0]
+                sub["a"]=a
+                return True
+
+            if rule=="mul_drop1" and t=="*":
+                a = [x for x in (sub.get("a") or []) if not (isinstance(x,dict) and x.get("t")=="c" and int(x.get("v",1))==1)]
+                if len(a)==0: return {"t":"c","v":1}
+                if len(a)==1: return a[0]
+                sub["a"]=a
+                return True
+
+            if rule=="mul_annihilate0" and t=="*":
+                for x in (sub.get("a") or []):
+                    if isinstance(x,dict) and x.get("t")=="c" and int(x.get("v",0))==0:
+                        return {"t":"c","v":0}
+                return False
+
+            if rule=="add_foldconst" and t=="+":
+                s=0; outa=[]; seen=False
+                for x in (sub.get("a") or []):
+                    if isinstance(x,dict) and x.get("t")=="c":
+                        s += int(x.get("v",0)); seen=True
+                    else:
+                        outa.append(x)
+                if seen: outa.append({"t":"c","v":s})
+                sub["a"]=outa
+                return seen
+
+            if rule=="mul_foldconst" and t=="*":
+                prod=1; outa=[]; seen=False
+                for x in (sub.get("a") or []):
+                    if isinstance(x,dict) and x.get("t")=="c":
+                        prod *= int(x.get("v",1)); seen=True
+                    else:
+                        outa.append(x)
+                if seen: outa.append({"t":"c","v":prod})
+                sub["a"]=outa
+                return seen
+
+            if rule=="distribute_left" and t=="*":
+                a = sub.get("a") or []
+                if len(a)!=2: return False
+                A,B = a[0],a[1]
+                if isinstance(B,dict) and B.get("t")=="+":
+                    terms=B.get("a") or []
+                    return {"t":"+","a":[{"t":"*","a":[A, t]} for t in terms]}
+                return False
+
+            if rule=="distribute_right" and t=="*":
+                a = sub.get("a") or []
+                if len(a)!=2: return False
+                B,A = a[0],a[1]
+                if isinstance(B,dict) and B.get("t")=="+":
+                    terms=B.get("a") or []
+                    return {"t":"+","a":[{"t":"*","a":[t, A]} for t in terms]}
+                return False
+
+            return False
+
+        # replay
+        cur = start
+        if not isinstance(cur, dict) or not isinstance(goal, dict):
+            return (False, "rw_bad_ast", 0)
+        if nodes(cur) > max_nodes:
+            return (False, "rw_start_exceeds_max_nodes", 0)
+        if len(steps) > max_steps:
+            return (False, "rw_too_many_steps", 0)
+
+        for st in steps:
+            rule = st.get("rule")
+            path = st.get("path") or []
+            sub = get_at(cur, path)
+            if sub is None or not isinstance(sub, dict):
+                return (False, "rw_bad_path", 0)
+            applied = apply_rule(sub, rule)
+            if applied is False:
+                return (False, "rw_rule_not_applicable", 0)
+            if isinstance(applied, dict):
+                cur = set_at(cur, path, applied)
+            if nodes(cur) > max_nodes:
+                return (False, "rw_max_nodes_exceeded", 0)
+
+        if cur != goal:
+            return (False, "rw_final_mismatch", 0)
+
+        credits = min(5000, 50 + 2*len(steps) + nodes(start)//4)
+        return (True, "ok", int(credits))
+
+
     return (False, "unknown_job_kind", 0)
+
+def _make_rw_eq_job_v1() -> dict:
+    # (x+y)*(x+y) 目标：展开并排序
+    start = {"t":"*","a":[{"t":"+","a":[{"t":"v","n":"x"},{"t":"v","n":"y"}]},{"t":"+","a":[{"t":"v","n":"x"},{"t":"v","n":"y"}]}]}
+    goal  = {"t":"+","a":[
+        {"t":"*","a":[{"t":"v","n":"x"},{"t":"v","n":"x"}]},
+        {"t":"*","a":[{"t":"v","n":"x"},{"t":"v","n":"y"}]},
+        {"t":"*","a":[{"t":"v","n":"y"},{"t":"v","n":"x"}]},
+        {"t":"*","a":[{"t":"v","n":"y"},{"t":"v","n":"y"}]},
+    ]}
+    return {"kind":"rw_eq_v1","theory":"ring_lite_v1","start":start,"goal":goal,"max_steps":400,"max_nodes":4000}
