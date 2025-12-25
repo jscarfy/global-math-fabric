@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 void main() {
+    // NOTE: You can move this widget into your existing settings screen later.
   runApp(const MyApp());
 }
 
