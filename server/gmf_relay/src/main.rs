@@ -215,6 +215,14 @@ fn write_identity_pubkey_once(server_pubkey_b64: &str) -> Result<(), String> {
     Ok(())
 }
 
+
+#[derive(Debug, Deserialize)]
+struct AuditAttestReq {
+    consent_token_json: serde_json::Value,
+    device_pubkey_b64: String,
+    attest_payload: serde_json::Value
+}
+
 struct AppState {
     tasks: Arc<Mutex<Vec<TaskSpec>>>,
     assigned: Arc<Mutex<HashMap<String, Lease>>>,      // lease_key "{task_id}::{device_id}"
@@ -1031,6 +1039,112 @@ async fn ledger_final(
     Ok((axum::http::StatusCode::OK, txt))
 }
 
+
+fn audit_path(date: &str) -> PathBuf {
+    PathBuf::from("ledger/audit").join(format!("{date}.audit.jsonl"))
+}
+
+fn append_audit_line(date: &str, line: &serde_json::Value) -> Result<(), String> {
+    let path = audit_path(date);
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    use std::io::Write;
+    let mut bytes = serde_json::to_vec(line).unwrap();
+    bytes.push(b'\n');
+    f.write_all(&bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+
+async fn audit_attest(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(req): axum::Json<AuditAttestReq>,
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    // Derive device_id from consent
+    let device_id = req.consent_token_json.get("device_id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+
+    verify_consent(&req.consent_token_json, &req.device_pubkey_b64, &device_id)
+        .map_err(|e| (axum::http::StatusCode::FORBIDDEN, e.to_string()))?;
+
+    // Extract date + claimed final sha
+    let date = req.attest_payload.get("date").and_then(|v| v.as_str())
+        .ok_or((axum::http::StatusCode::BAD_REQUEST, "missing attest_payload.date".into()))?
+        .to_string();
+
+    let claimed_sha = req.attest_payload.get("final_ssr_sha256").and_then(|v| v.as_str())
+        .ok_or((axum::http::StatusCode::BAD_REQUEST, "missing attest_payload.final_ssr_sha256".into()))?
+        .to_string();
+
+    // Require immutable final snapshot exists and matches claimed_sha
+    let final_path = final_snapshot_path(&date);
+    if !final_path.exists() {
+        return Err((axum::http::StatusCode::PRECONDITION_FAILED, "no final snapshot".into()));
+    }
+    let final_txt = std::fs::read_to_string(&final_path)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let final_env: serde_json::Value = serde_json::from_str(&final_txt)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let final_sha = final_env.get("final_payload").and_then(|p| p.get("ssr_sha256")).and_then(|v| v.as_str())
+        .ok_or((axum::http::StatusCode::INTERNAL_SERVER_ERROR, "bad final format".into()))?
+        .to_string();
+
+    if final_sha != claimed_sha {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "final sha mismatch".into()));
+    }
+
+    // Optional: require client said sig_ok true
+    let sig_ok = req.attest_payload.get("final_sig_ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !sig_ok {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "final_sig_ok must be true".into()));
+    }
+
+    // Compose server-signed audit record
+    // Note: server_sign_fn + server_pubkey_b64_str MUST be wired (from earlier steps).
+    let mut payload = req.attest_payload.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("device_id".to_string(), serde_json::Value::String(device_id.clone()));
+        obj.insert("device_pubkey_b64".to_string(), serde_json::Value::String(req.device_pubkey_b64.clone()));
+        obj.insert("server_time_unix_ms".to_string(), serde_json::Value::Number(now_unix_ms().into()));
+        obj.insert("final_server_pubkey_b64".to_string(),
+            final_env.get("server_pubkey_b64").cloned().unwrap_or(serde_json::Value::Null));
+        obj.insert("final_server_sig_b64".to_string(),
+            final_env.get("server_sig_b64").cloned().unwrap_or(serde_json::Value::Null));
+    }
+
+    let canon = canonical_json_bytes(&payload);
+    let msg = sha2::Sha256::digest(&canon);
+    let sig_b64 = server_sign_fn.as_ref()(&msg);
+
+    let audit_env = serde_json::json!({
+        "audit_payload": payload,
+        "server_pubkey_b64": server_pubkey_b64_str,
+        "server_sig_b64": sig_b64
+    });
+
+    append_audit_line(&date, &audit_env).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok((axum::http::StatusCode::OK, serde_json::to_string_pretty(&audit_env).unwrap()))
+}
+
+async fn audit_log(
+    axum::extract::Path(date): axum::extract::Path<String>
+) -> Result<(axum::http::StatusCode, String), (axum::http::StatusCode, String)> {
+    if date.len() != 10 || &date[4..5] != "-" || &date[7..8] != "-" {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "bad date".into()));
+    }
+    let path = audit_path(&date);
+    if !path.exists() {
+        return Err((axum::http::StatusCode::NOT_FOUND, "no audit log".into()));
+    }
+    let txt = std::fs::read_to_string(&path)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((axum::http::StatusCode::OK, txt))
+}
+
 async fn health() -> &'static str { "ok" }
 
 #[tokio::main]
@@ -1103,6 +1217,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ledger/snapshot/:date", get(ledger_snapshot))
         .route("/v1/ledger/finalize/:date", get(ledger_finalize))
         .route("/v1/ledger/final/:date", get(ledger_final))
+        .route("/v1/audit/attest", post(audit_attest))
+        .route("/v1/audit/log/:date", get(audit_log))
         .route("/v1/tasks/pull", post(pull_task))
         .route("/v1/tasks/submit", post(submit_task))
         .with_state(state);
