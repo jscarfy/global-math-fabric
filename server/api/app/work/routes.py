@@ -835,3 +835,123 @@ def _sigmsg_v1_bytes(fields: dict) -> bytes:
     for k in keys:
         lines.append(f"{k}={val(k)}\n")
     return "".join(lines).encode("utf-8")
+
+import random
+
+def _make_job_input_v1(topic: str) -> dict:
+    # topic can select job families; default -> pow_v1
+    if topic == "poly":
+        # simple identity: (x+y)^2 == x^2 + 2xy + y^2
+        return {
+            "kind":"poly_identity_v1",
+            "vars":["x","y"],
+            "lhs":[{"c":1,"e":[2,0]},{"c":2,"e":[1,1]},{"c":1,"e":[0,2]}],
+            "rhs":[{"c":1,"e":[2,0]},{"c":2,"e":[1,1]},{"c":1,"e":[0,2]}],
+        }
+    # pow difficulty baseline (policy can later vary per device)
+    seed = hashlib.sha256(os.urandom(32)).hexdigest()
+    return {"kind":"pow_v1","seed_hex":seed,"difficulty":18}
+
+def _verify_job_output_v1(job_input: dict, output_str: str) -> tuple[bool,str,int]:
+    """
+    returns (ok, reason, credits)
+    credits here is baseline; policy can further adjust.
+    """
+    try:
+        out = json.loads(output_str)
+    except Exception:
+        return (False, "output_not_json", 0)
+
+    kind = (job_input.get("kind") or "").strip()
+    ok_kind = (out.get("kind") or "").strip()
+
+    if kind == "pow_v1":
+        if ok_kind != "pow_v1_result":
+            return (False, "pow_wrong_kind", 0)
+        seed_hex = str(job_input.get("seed_hex","")).lower().strip()
+        diff = int(job_input.get("difficulty",0))
+        try:
+            nonce = int(out.get("nonce"))
+        except Exception:
+            return (False, "pow_bad_nonce", 0)
+
+        # recompute sha256(seed||nonce_le)
+        try:
+            seed = bytes.fromhex(seed_hex)
+        except Exception:
+            return (False, "pow_bad_seed", 0)
+        h = hashlib.sha256(seed + nonce.to_bytes(8,'little',signed=False)).digest()
+        # count leading zero bits
+        lz = 0
+        for b in h:
+            if b == 0:
+                lz += 8
+                continue
+            lz += (8 - len(bin(b)) + 2)  # wrong; patch below
+            break
+        # fix: pythonic leading_zeros
+        lz = 0
+        for b in h:
+            if b == 0:
+                lz += 8
+            else:
+                lz += (8 - (b.bit_length()))
+                break
+
+        if lz < diff:
+            return (False, "pow_difficulty_not_met", 0)
+
+        # baseline credits: 2^(diff-10) capped
+        credits = 1 << max(0, diff - 10)
+        credits = min(credits, 1<<18)
+        return (True, "ok", int(credits))
+
+    if kind == "poly_identity_v1":
+        if ok_kind != "poly_identity_v1_result":
+            return (False, "poly_wrong_kind", 0)
+        # recompute nf(lhs-rhs)
+        vars_ = job_input.get("vars") or []
+        lhs = job_input.get("lhs") or []
+        rhs = job_input.get("rhs") or []
+
+        def norm(terms):
+            # combine like exponents
+            mp = {}
+            for t in terms:
+                c = int(t.get("c",0))
+                e = tuple(int(x) for x in (t.get("e") or []))
+                if c == 0: 
+                    continue
+                mp[e] = mp.get(e,0) + c
+            out = []
+            for e,c in mp.items():
+                if c != 0:
+                    out.append({"c":int(c),"e":[int(x) for x in e]})
+            out.sort(key=lambda t: (t["e"], t["c"]))
+            # trim trailing zeros in e
+            for t in out:
+                while t["e"] and t["e"][-1] == 0:
+                    t["e"].pop()
+            out.sort(key=lambda t: (t["e"], t["c"]))
+            return out
+
+        diff = []
+        for t in lhs:
+            diff.append({"c":int(t.get("c",0)),"e":t.get("e") or []})
+        for t in rhs:
+            diff.append({"c":-int(t.get("c",0)),"e":t.get("e") or []})
+
+        nf = norm(diff)
+        claimed_nf = out.get("nf") or []
+        if norm(claimed_nf) != nf:
+            return (False, "poly_nf_mismatch", 0)
+
+        claimed_ok = bool(out.get("ok", False))
+        if claimed_ok != (len(nf) == 0):
+            return (False, "poly_ok_flag_wrong", 0)
+
+        # baseline credits ~ size
+        credits = min(1000, 10 + 2*len(lhs) + 2*len(rhs) + sum(sum(int(x) for x in (t.get("e") or [])) for t in lhs+rhs))
+        return (True, "ok", int(credits))
+
+    return (False, "unknown_job_kind", 0)
