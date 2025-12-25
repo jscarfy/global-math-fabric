@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 REC_MAN_DIR = Path(os.environ.get("GMF_RECEIPTS_MANIFESTS_DIR", "ledger/receipts/manifests"))
 VER_MAN_DIR = Path(os.environ.get("GMF_VERIFICATIONS_MANIFESTS_DIR", "ledger/verifications/manifests"))
+XLINK_MAN_DIR = Path(os.environ.get("GMF_XLINKS_MANIFESTS_DIR", "ledger/xlinks/manifests"))
 OUT_DIR = Path(os.environ.get("GMF_DAILY_ROOTS_DIR", "ledger/daily_roots"))
 
 def canon_bytes(obj) -> bytes:
@@ -19,6 +20,7 @@ def main():
 
     rec = REC_MAN_DIR / f"{day}.manifest.json"
     ver = VER_MAN_DIR / f"{day}.verifications.manifest.json"
+    xlm = XLINK_MAN_DIR / f"{day}.xlinks.manifest.json"
 
     root = {
         "kind": "gmf_daily_root_manifest",
@@ -27,6 +29,7 @@ def main():
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "receipts_manifest": {"path": str(rec), "sha256": sha256_path(rec)} if rec.exists() else None,
         "verifications_manifest": {"path": str(ver), "sha256": sha256_path(ver)} if ver.exists() else None,
+        "xlinks_manifest": {"path": str(xlm), "sha256": sha256_path(xlm)} if xlm.exists() else None,
         "notes": "Audit chain should hash only this daily root (public), not private receipts content.",
     }
 

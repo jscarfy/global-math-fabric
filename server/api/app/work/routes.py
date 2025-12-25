@@ -1,4 +1,5 @@
 import hashlib
+from app.work.db.models import LeaseUse
 import os
 import json
 from pathlib import Path
@@ -149,6 +150,18 @@ def pull_job(device_id: str, topics: str = ""):
             return {"ok": True, "job": None}
 
         lease_id = str(uuid.uuid4())
+
+        # replay protection: each lease_id can be submitted at most once
+
+        replay = _lease_used(db, lease_id)
+
+        if replay:
+
+            accepted = False
+
+            reason = 'replay_lease_id'
+
+            awarded_credits = 0
         exp = _now() + datetime.timedelta(seconds=LEASE_SECONDS)
         l = JobLease(lease_id=lease_id, job_id=j.job_id, device_id=device_id, expires_at=exp, active=True)
         j.status = "leased"
@@ -364,3 +377,12 @@ def _write_verification_record(rec: dict) -> str:
         p.write_bytes(b)
     return h
 
+
+GMF_XLINK_DIR = os.environ.get('GMF_XLINK_DIR', 'ledger/xlinks')
+
+def _require_challenge_fields(job_obj: dict, submit_obj: dict):
+    req = job_obj.get("challenge_required_fields") or []
+    for k in req:
+        if k not in submit_obj or submit_obj.get(k) in (None, "", []):
+            return False, f"challenge_missing_field:{k}"
+    return True, ""
