@@ -127,3 +127,5 @@ volumes:
       - LEAN_TIMEOUT_SEC=20
     ports:
       - "8091:8090"
+
+# GMF_POLICY_PATH/GMF_POLICY_HASH envs could not be auto-placed; add under api:environment manually.

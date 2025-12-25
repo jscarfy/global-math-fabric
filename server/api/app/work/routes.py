@@ -156,6 +156,18 @@ def pull_job(device_id: str, topics: str = ""):
         # challenge nonce verification (bind submit to issued lease)
 
         lc = _lease_challenge_get(db, lease_id)
+        # policy hash binding: client must echo current policy_hash
+        sub = submit_obj if 'submit_obj' in locals() else (submission if 'submission' in locals() else {})
+        submitted_policy = sub.get('policy_hash')
+        if not submitted_policy:
+            accepted = False
+            reason = 'policy_hash_missing'
+            awarded_credits = 0
+        elif str(submitted_policy).lower() != str(GMF_POLICY_HASH).lower():
+            accepted = False
+            reason = 'policy_hash_mismatch'
+            awarded_credits = 0
+
 
         if lc is not None:
 
@@ -594,3 +606,23 @@ def _verify_bundle_v1_header(header_bytes: bytes, header_sha256: str) -> tuple[b
     if not req.issubset(names):
         return False, "bundle_header_missing_required_files"
     return True, ""
+
+
+GMF_POLICY_PATH = os.environ.get("GMF_POLICY_PATH", "ledger/policies/credit_policy_v2_bundle_v1.md")
+GMF_POLICY_HASH_OVERRIDE = os.environ.get("GMF_POLICY_HASH", "").strip()
+
+def _load_policy_hash() -> tuple[str,str]:
+    # returns (policy_hash, policy_name)
+    policy_name = Path(GMF_POLICY_PATH).name
+    if GMF_POLICY_HASH_OVERRIDE:
+        return (GMF_POLICY_HASH_OVERRIDE.lower(), policy_name)
+    try:
+        b = Path(GMF_POLICY_PATH).read_bytes()
+        h = hashlib.sha256(b).hexdigest()
+        return (h, policy_name)
+    except Exception:
+        # If policy file missing, we still return a sentinel; but better to fail fast in production.
+        h = hashlib.sha256(f"MISSING:{GMF_POLICY_PATH}".encode("utf-8")).hexdigest()
+        return (h, policy_name)
+
+GMF_POLICY_HASH, GMF_POLICY_NAME = _load_policy_hash()
