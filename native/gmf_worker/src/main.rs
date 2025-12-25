@@ -331,6 +331,35 @@ async fn main() -> anyhow::Result<()> {
 
             "final_verify" => {
                 let rc = crate::helper_tasks::run_final_verify(&relay_base_url, &task.params).await?;
+
+                // Auto-attest (default true) — writes a server-signed audit receipt
+                let do_attest = task.params.get("attest").and_then(|v| v.as_bool()).unwrap_or(true);
+                if do_attest {
+                    if let (Some(date), Some(final_sig_ok), Some(final_sha)) = (
+                        rc.get("date").and_then(|v| v.as_str()),
+                        rc.get("final_sig_ok").and_then(|v| v.as_bool()),
+                        rc.get("inbox_sha_matches_final").or_else(|| Some(&serde_json::Value::Null)).cloned(),
+                    ) {
+                        // Build minimal attest_payload; relay enforces final existence + sha match + final_sig_ok==true
+                        let attest_payload = serde_json::json!({
+                            "date": date,
+                            "final_sig_ok": final_sig_ok,
+                            "final_ssr_sha256": rc.get("snapshot_sha256").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            "verifier_kind": "gmf_worker_helper",
+                            "verifier_version": env!("CARGO_PKG_VERSION")
+                        });
+
+                        let body = serde_json::json!({
+                            "consent_token_json": consent_token_json,
+                            "device_pubkey_b64": device_pubkey_b64,
+                            "attest_payload": attest_payload
+                        });
+
+                        let url = format!("{}/v1/audit/attest", relay_base_url.trim_end_matches('/'));
+                        let _ = reqwest::Client::new().post(&url).json(&body).send().await;
+                    }
+                }
+
                 rc
             }
 "lean_check" => {
