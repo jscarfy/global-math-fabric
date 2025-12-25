@@ -25,6 +25,18 @@ pub enum JobInput {
         challenge_seed_hex: String,
         challenge_pow_difficulty: u32,
     },
+
+    #[serde(rename="rw_eq_v3")]
+    RwEqV3 {
+        theory: String,
+        start: rw_eq_v1::Expr,
+        goal: rw_eq_v1::Expr,
+        max_steps: u32,
+        max_nodes: u32,
+        challenge_seed_hex: String,
+        challenge_pow_difficulty: u32,
+        checkpoint_indices: Vec<u32>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -50,6 +62,19 @@ pub enum JobOutput {
         pow_hash_hex: String,
     },
 
+    #[serde(rename="rw_eq_v3_result")]
+    RwEqV3Result {
+        ok: bool,
+        final_: rw_eq_v1::Expr,
+        steps: Vec<rw_eq_v1::Step>,
+        stats: rw_eq_v1::Stats,
+        transcript_sha256: String,
+        pow_nonce: u64,
+        pow_hash_hex: String,
+        checkpoints: Vec<Checkpoint>,
+        checkpoints_root_hex: String,
+    },
+
     #[serde(rename="gmf_error")]
     Error { message: String },
 }
@@ -58,6 +83,12 @@ pub enum JobOutput {
 pub struct Term {
     pub c: i64,
     pub e: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Checkpoint {
+    pub i: u32,
+    pub expr_sha256: String,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -152,9 +183,7 @@ pub fn run_job_json(input_json: &str) -> JobOutput {
         }
 
         Ok(JobInput::RwEqV1{theory, start, goal, max_steps, max_nodes}) => {
-            if theory != "ring_lite_v1" {
-                return JobOutput::Error{ message: "unsupported theory".to_string() };
-            }
+            if theory != "ring_lite_v1" { return JobOutput::Error{ message: "unsupported theory".into() }; }
             match rw_eq_v1::solve_rw_eq_v1(start, goal, max_steps, max_nodes) {
                 rw_eq_v1::Output::Ok{ok, final_, steps, stats} => JobOutput::RwEqV1Result{ ok, final_, steps, stats },
                 rw_eq_v1::Output::Err{message} => JobOutput::Error{ message },
@@ -162,28 +191,47 @@ pub fn run_job_json(input_json: &str) -> JobOutput {
         }
 
         Ok(JobInput::RwEqV2{theory, start, goal, max_steps, max_nodes, challenge_seed_hex, challenge_pow_difficulty}) => {
-            if theory != "ring_lite_v1" {
-                return JobOutput::Error{ message: "unsupported theory".to_string() };
-            }
+            if theory != "ring_lite_v1" { return JobOutput::Error{ message: "unsupported theory".into() }; }
             match rw_eq_v1::solve_rw_eq_v1(start.clone(), goal.clone(), max_steps, max_nodes) {
                 rw_eq_v1::Output::Err{message} => JobOutput::Error{ message },
                 rw_eq_v1::Output::Ok{ok, final_, steps, stats} => {
                     let tsha = match rw_eq_v1::transcript_sha256_hex(&start, &goal, &steps) {
-                        Ok(x) => x,
-                        Err(e) => return JobOutput::Error{ message: format!("transcript hash err: {e}") }
+                        Ok(x) => x, Err(e) => return JobOutput::Error{ message: format!("transcript hash err: {e}") }
                     };
                     let (nonce, pow_hex) = match rw_eq_v1::solve_pow_for_transcript(&challenge_seed_hex, &tsha, challenge_pow_difficulty) {
-                        Ok(x) => x,
-                        Err(e) => return JobOutput::Error{ message: format!("pow err: {e}") }
+                        Ok(x) => x, Err(e) => return JobOutput::Error{ message: format!("pow err: {e}") }
                     };
-                    JobOutput::RwEqV2Result{
-                        ok,
-                        final_,
-                        steps,
-                        stats,
+                    JobOutput::RwEqV2Result{ ok, final_, steps, stats, transcript_sha256: tsha, pow_nonce: nonce, pow_hash_hex: pow_hex }
+                }
+            }
+        }
+
+        Ok(JobInput::RwEqV3{theory, start, goal, max_steps, max_nodes, challenge_seed_hex, challenge_pow_difficulty, checkpoint_indices}) => {
+            if theory != "ring_lite_v1" { return JobOutput::Error{ message: "unsupported theory".into() }; }
+            match rw_eq_v1::solve_rw_eq_v1(start.clone(), goal.clone(), max_steps, max_nodes) {
+                rw_eq_v1::Output::Err{message} => JobOutput::Error{ message },
+                rw_eq_v1::Output::Ok{ok, final_, steps, stats} => {
+                    let tsha = match rw_eq_v1::transcript_sha256_hex(&start, &goal, &steps) {
+                        Ok(x) => x, Err(e) => return JobOutput::Error{ message: format!("transcript hash err: {e}") }
+                    };
+                    let (nonce, pow_hex) = match rw_eq_v1::solve_pow_for_transcript(&challenge_seed_hex, &tsha, challenge_pow_difficulty) {
+                        Ok(x) => x, Err(e) => return JobOutput::Error{ message: format!("pow err: {e}") }
+                    };
+
+                    let cps = match rw_eq_v1::replay_and_collect_checkpoints(start.clone(), &steps, &checkpoint_indices, max_steps, max_nodes) {
+                        Ok(v) => v,
+                        Err(e) => return JobOutput::Error{ message: format!("checkpoint replay err: {e}") }
+                    };
+                    let checkpoints: Vec<Checkpoint> = cps.iter().map(|(i,h)| Checkpoint{i:*i, expr_sha256:h.clone()}).collect();
+                    let root = rw_eq_v1::checkpoints_sha256(&cps);
+
+                    JobOutput::RwEqV3Result{
+                        ok, final_, steps, stats,
                         transcript_sha256: tsha,
                         pow_nonce: nonce,
                         pow_hash_hex: pow_hex,
+                        checkpoints,
+                        checkpoints_root_hex: root,
                     }
                 }
             }

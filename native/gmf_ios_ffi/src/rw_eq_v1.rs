@@ -361,3 +361,91 @@ pub fn solve_pow_for_transcript(seed_hex: &str, transcript_hex: &str, difficulty
         if nonce == 0 { return Err("nonce wrapped; difficulty too high".into()); }
     }
 }
+
+
+/* ---------- checkpoint helpers ---------- */
+
+fn json_canon_value(v: &serde_json::Value) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut btm: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for (k, vv) in map.iter() {
+                btm.insert(k.clone(), json_canon_value(vv));
+            }
+            let mut out = serde_json::Map::new();
+            for (k, vv) in btm.into_iter() { out.insert(k, vv); }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(json_canon_value).collect()),
+        _ => v.clone(),
+    }
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
+
+pub fn expr_sha256_hex(e: &Expr) -> Result<String, String> {
+    let v = serde_json::to_value(e).map_err(|e| e.to_string())?;
+    let canon = json_canon_value(&v);
+    let b = serde_json::to_vec(&canon).map_err(|e| e.to_string())?;
+    Ok(sha256_hex_bytes(&b))
+}
+
+/// Deterministic linear hash over checkpoints list:
+/// root = sha256( sha256( ... sha256(0||"i:hash") ... ) )
+pub fn checkpoints_sha256(checkpoints: &[(u32, String)]) -> String {
+    let mut h = [0u8;32];
+    for (i, hx) in checkpoints.iter() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&h);
+        msg.extend_from_slice(format!("{}:{}", i, hx).as_bytes());
+        let d = Sha256::digest(&msg);
+        h.copy_from_slice(&d[..]);
+    }
+    hex::encode(h)
+}
+
+pub fn replay_and_collect_checkpoints(
+    start: Expr,
+    steps: &[Step],
+    checkpoint_indices: &[u32],
+    max_steps: u32,
+    max_nodes: u32,
+) -> Result<Vec<(u32, String)>, String> {
+    if steps.len() as u32 > max_steps { return Err("too many steps".into()); }
+
+    let mut wanted = checkpoint_indices.to_vec();
+    wanted.sort();
+    wanted.dedup();
+
+    let mut out: Vec<(u32, String)> = Vec::new();
+    let mut cur = start;
+
+    // i=0 checkpoint: start
+    if wanted.binary_search(&0).is_ok() {
+        out.push((0, expr_sha256_hex(&cur)?));
+    }
+
+    for (k, st) in steps.iter().enumerate() {
+        // reuse replay code path by applying at root using path resolver already present
+        // We'll apply rule by navigating path
+        let sub = get_mut_at(&mut cur, &st.path).ok_or("bad path")?;
+        let before = sub.clone();
+        let changed = apply_rule_at(sub, st.rule.as_str());
+        if !changed { return Err("rule not applicable at path".into()); }
+        if nodes(&cur) > max_nodes {
+            *sub = before;
+            return Err("max_nodes exceeded".into());
+        }
+
+        let idx = (k as u32) + 1;
+        if wanted.binary_search(&idx).is_ok() {
+            out.push((idx, expr_sha256_hex(&cur)?));
+        }
+    }
+    Ok(out)
+}
