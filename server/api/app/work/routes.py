@@ -886,7 +886,7 @@ import random
 def _make_job_input_v1(topic: str) -> dict:
     # topic can select job families; default -> pow_v1
     if topic == "rw":
-        return _make_rw_eq_job_v1()
+        return _make_rw_eq_job_v2()
     if topic == "poly":
         # simple identity: (x+y)^2 == x^2 + 2xy + y^2
         return {
@@ -1001,6 +1001,11 @@ def _verify_job_output_v1(job_input: dict, output_str: str) -> tuple[bool,str,in
         credits = min(1000, 10 + 2*len(lhs) + 2*len(rhs) + sum(sum(int(x) for x in (t.get("e") or [])) for t in lhs+rhs))
         return (True, "ok", int(credits))
 
+
+    if kind == "rw_eq_v2":
+        if ok_kind != "rw_eq_v2_result":
+            return (False, "rw_wrong_kind", 0)
+        return _verify_rw_eq_v2(job_input, out)
 
     if kind == "rw_eq_v1":
         # output expected JSON with kind=rw_eq_v1_result
@@ -1400,3 +1405,251 @@ def _make_rw_eq_job_v1(seed_hex=None) -> dict:
     max_nodes  = 6000
     goal = _rw_normalize(start, max_steps, max_nodes)
     return {"kind":"rw_eq_v1","theory":"ring_lite_v1","start":start,"goal":goal,"max_steps":max_steps,"max_nodes":max_nodes, "seed_hex": seed_hex}
+
+
+def _canon_json_bytes(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+def _sha256_hex_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def _leading_zero_bits(d: bytes) -> int:
+    n = 0
+    for bb in d:
+        if bb == 0:
+            n += 8
+        else:
+            n += (8 - bb.bit_length())
+            break
+    return n
+
+def _verify_rw_eq_v2(job_input: dict, out: dict) -> tuple[bool,str,int]:
+    # 1) replay (reuse your existing rw_eq_v1 replay verifier logic already in _verify_job_output_v1)
+    # We'll just call the v1 replay branch by temporarily mapping fields.
+    # But to be safe, do a local replay (minimal copy of earlier logic)
+    start = job_input.get("start")
+    goal  = job_input.get("goal")
+    max_steps = int(job_input.get("max_steps", 0))
+    max_nodes = int(job_input.get("max_nodes", 0))
+    steps = out.get("steps") or []
+
+    def nodes(expr):
+        if not isinstance(expr, dict): return 0
+        t = expr.get("t")
+        if t in ("c","v"): return 1
+        if t in ("+","*"):
+            a = expr.get("a") or []
+            return 1 + sum(nodes(x) for x in a)
+        return 1
+
+    def canon_key(expr):
+        t = expr.get("t")
+        if t=="c": return f"c:{int(expr.get('v',0))}"
+        if t=="v": return f"v:{expr.get('n','')}"
+        if t in ("+","*"):
+            ks = [canon_key(x) for x in (expr.get("a") or [])]
+            ks.sort()
+            return f"{t}(" + ",".join(ks) + ")"
+        return "?"
+
+    def get_at(expr, path):
+        cur = expr
+        for i in path:
+            a = cur.get("a") or []
+            if int(i) < 0 or int(i) >= len(a): return None
+            cur = a[int(i)]
+        return cur
+
+    def set_at(expr, path, new_sub):
+        if not path: return new_sub
+        cur = expr
+        for i in path[:-1]:
+            a = cur.get("a") or []
+            cur = a[int(i)]
+        a = cur.get("a") or []
+        a[int(path[-1])] = new_sub
+        cur["a"] = a
+        return expr
+
+    def apply_rule(sub, rule):
+        t = sub.get("t")
+        if rule=="add_flatten" and t=="+":
+            outa=[]; changed=False
+            for x in (sub.get("a") or []):
+                if isinstance(x, dict) and x.get("t")=="+": outa.extend(x.get("a") or []); changed=True
+                else: outa.append(x)
+            if changed: sub["a"]=outa
+            return changed
+
+        if rule=="mul_flatten" and t=="*":
+            outa=[]; changed=False
+            for x in (sub.get("a") or []):
+                if isinstance(x, dict) and x.get("t")=="*": outa.extend(x.get("a") or []); changed=True
+                else: outa.append(x)
+            if changed: sub["a"]=outa
+            return changed
+
+        if rule=="add_sort" and t=="+":
+            a = sub.get("a") or []
+            before=[canon_key(x) for x in a]
+            a.sort(key=canon_key)
+            after=[canon_key(x) for x in a]
+            sub["a"]=a
+            return before!=after
+
+        if rule=="mul_sort" and t=="*":
+            a = sub.get("a") or []
+            before=[canon_key(x) for x in a]
+            a.sort(key=canon_key)
+            after=[canon_key(x) for x in a]
+            sub["a"]=a
+            return before!=after
+
+        if rule=="add_drop0" and t=="+":
+            a = [x for x in (sub.get("a") or []) if not (isinstance(x,dict) and x.get("t")=="c" and int(x.get("v",0))==0)]
+            if len(a)==0: return {"t":"c","v":0}
+            if len(a)==1: return a[0]
+            sub["a"]=a
+            return True
+
+        if rule=="mul_drop1" and t=="*":
+            a = [x for x in (sub.get("a") or []) if not (isinstance(x,dict) and x.get("t")=="c" and int(x.get("v",1))==1)]
+            if len(a)==0: return {"t":"c","v":1}
+            if len(a)==1: return a[0]
+            sub["a"]=a
+            return True
+
+        if rule=="mul_annihilate0" and t=="*":
+            for x in (sub.get("a") or []):
+                if isinstance(x,dict) and x.get("t")=="c" and int(x.get("v",0))==0:
+                    return {"t":"c","v":0}
+            return False
+
+        if rule=="add_foldconst" and t=="+":
+            s=0; outa=[]; seen=False
+            for x in (sub.get("a") or []):
+                if isinstance(x,dict) and x.get("t")=="c":
+                    s += int(x.get("v",0)); seen=True
+                else:
+                    outa.append(x)
+            if seen: outa.append({"t":"c","v":s})
+            sub["a"]=outa
+            return seen
+
+        if rule=="mul_foldconst" and t=="*":
+            prod=1; outa=[]; seen=False
+            for x in (sub.get("a") or []):
+                if isinstance(x,dict) and x.get("t")=="c":
+                    prod *= int(x.get("v",1)); seen=True
+                else:
+                    outa.append(x)
+            if seen: outa.append({"t":"c","v":prod})
+            sub["a"]=outa
+            return seen
+
+        if rule=="distribute_left" and t=="*":
+            a = sub.get("a") or []
+            if len(a)!=2: return False
+            A,B = a[0],a[1]
+            if isinstance(B,dict) and B.get("t")=="+":
+                terms=B.get("a") or []
+                return {"t":"+","a":[{"t":"*","a":[A, t]} for t in terms]}
+            return False
+
+        if rule=="distribute_right" and t=="*":
+            a = sub.get("a") or []
+            if len(a)!=2: return False
+            B,A = a[0],a[1]
+            if isinstance(B,dict) and B.get("t")=="+":
+                terms=B.get("a") or []
+                return {"t":"+","a":[{"t":"*","a":[t, A]} for t in terms]}
+            return False
+
+        return False
+
+    if not isinstance(start, dict) or not isinstance(goal, dict):
+        return (False, "rw_bad_ast", 0)
+    if nodes(start) > max_nodes:
+        return (False, "rw_start_exceeds_max_nodes", 0)
+    if len(steps) > max_steps:
+        return (False, "rw_too_many_steps", 0)
+
+    cur = start
+    for st in steps:
+        rule = st.get("rule")
+        path = st.get("path") or []
+        sub = get_at(cur, path)
+        if sub is None or not isinstance(sub, dict):
+            return (False, "rw_bad_path", 0)
+        applied = apply_rule(sub, rule)
+        if applied is False:
+            return (False, "rw_rule_not_applicable", 0)
+        if isinstance(applied, dict):
+            cur = set_at(cur, path, applied)
+        if nodes(cur) > max_nodes:
+            return (False, "rw_max_nodes_exceeded", 0)
+
+    if cur != goal:
+        return (False, "rw_final_mismatch", 0)
+
+    # 2) transcript hash
+    transcript_obj = {"start": start, "goal": goal, "steps": steps}
+    tsha = _sha256_hex_bytes(_canon_json_bytes(transcript_obj))
+    if str(out.get("transcript_sha256","")).lower() != tsha:
+        return (False, "rw_transcript_hash_mismatch", 0)
+
+    # 3) challenge PoW
+    seed_hex = str(job_input.get("challenge_seed_hex","")).strip()
+    diff = int(job_input.get("challenge_pow_difficulty", 0))
+    try:
+        seed = bytes.fromhex(seed_hex)
+    except Exception:
+        return (False, "rw_bad_seed_hex", 0)
+
+    try:
+        nonce = int(out.get("pow_nonce"))
+    except Exception:
+        return (False, "rw_bad_pow_nonce", 0)
+
+    th = bytes.fromhex(tsha)
+    h = hashlib.sha256(seed + th + nonce.to_bytes(8,'little',signed=False)).digest()
+    if _leading_zero_bits(h) < diff:
+        return (False, "rw_pow_not_met", 0)
+
+    if str(out.get("pow_hash_hex","")).lower() != h.hex():
+        return (False, "rw_pow_hash_mismatch", 0)
+
+    base_proof = min(5000, 50 + 2*len(steps) + nodes(start)//4)
+    base_pow = min(1<<18, 1 << max(0, diff - 10))
+    return (True, "ok", int(base_proof + base_pow))
+
+
+def _make_rw_eq_job_v2(seed_hex=None) -> dict:
+    if seed_hex is None:
+        seed_hex = hashlib.sha256(os.urandom(32)).hexdigest()
+
+    # 仍然用你現有的 seeded rw 生成 start + goal=normalize(start)
+    # 如果你之前已經有 _make_rw_eq_job_v1(seed_hex) 生成 goal，
+    # 直接呼叫它再包成 v2。
+    try:
+        base = _make_rw_eq_job_v1(seed_hex)
+        start = base["start"]
+        goal = base["goal"]
+        max_steps = int(base.get("max_steps", 600))
+        max_nodes  = int(base.get("max_nodes", 6000))
+    except Exception:
+        # fallback: simplest start/goal
+        start = {"t":"*","a":[{"t":"+","a":[{"t":"v","n":"x"},{"t":"v","n":"y"}]},{"t":"+","a":[{"t":"v","n":"x"},{"t":"v","n":"y"}]}]}
+        goal  = start
+        max_steps, max_nodes = 600, 6000
+
+    return {
+        "kind":"rw_eq_v2",
+        "theory":"ring_lite_v1",
+        "start": start,
+        "goal": goal,
+        "max_steps": max_steps,
+        "max_nodes": max_nodes,
+        "challenge_seed_hex": hashlib.sha256((seed_hex + ":pow").encode("utf-8")).hexdigest(),
+        "challenge_pow_difficulty": 18,
+    }
