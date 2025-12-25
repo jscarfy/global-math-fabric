@@ -1,5 +1,7 @@
+import random
+import base64
 import hashlib
-from app.work.db.models import LeaseUse
+from app.work.db.models import LeaseUse, LeaseChallenge
 import os
 import json
 from pathlib import Path
@@ -150,6 +152,30 @@ def pull_job(device_id: str, topics: str = ""):
             return {"ok": True, "job": None}
 
         lease_id = str(uuid.uuid4())
+
+        # challenge nonce verification (bind submit to issued lease)
+
+        lc = _lease_challenge_get(db, lease_id)
+
+        if lc is not None:
+
+            submitted_nonce = (submit_obj.get('challenge_nonce') if 'submit_obj' in locals() else (submission.get('challenge_nonce') if 'submission' in locals() else None))
+
+            if not submitted_nonce or str(submitted_nonce) != str(lc.nonce_hex):
+
+                accepted = False
+
+                reason = 'challenge_bad_nonce'
+
+                awarded_credits = 0
+
+        challenge_nonce = _challenge_nonce_hex()
+
+        required_fields = _job_required_fields(job_obj if 'job_obj' in locals() else job)
+
+        audit_required = _audit_required(job_obj if 'job_obj' in locals() else job)
+
+        _lease_challenge_put(db, lease_id, device_id, job_id, challenge_nonce, audit_required, required_fields, ts_utc)
 
         # replay protection: each lease_id can be submitted at most once
 
@@ -386,3 +412,91 @@ def _require_challenge_fields(job_obj: dict, submit_obj: dict):
         if k not in submit_obj or submit_obj.get(k) in (None, "", []):
             return False, f"challenge_missing_field:{k}"
     return True, ""
+
+GMF_AUDIT_BUNDLE_DIR = os.environ.get('GMF_AUDIT_BUNDLE_DIR', 'ledger/audit_bundles')
+
+GMF_AUDIT_DEFAULT_RATE = float(os.environ.get('GMF_AUDIT_DEFAULT_RATE', '0.01'))
+
+def _challenge_nonce_hex(nbytes: int = 16) -> str:
+    return os.urandom(nbytes).hex()
+
+def _csv_norm(s: str) -> str:
+    parts = [p.strip() for p in (s or "").split(",")]
+    parts = [p for p in parts if p]
+    # unique keep order
+    seen=set(); out=[]
+    for p in parts:
+        if p not in seen:
+            out.append(p); seen.add(p)
+    return ",".join(out)
+
+def _job_required_fields(job_obj: dict) -> list[str]:
+    # job can define: {"challenge_required_fields":["lean_trace_hash"], "audit_rate":0.02}
+    req = job_obj.get("challenge_required_fields") or job_obj.get("challenge", {}).get("required_fields") or []
+    if isinstance(req, str):
+        req = [x.strip() for x in req.split(",") if x.strip()]
+    return [str(x) for x in req]
+
+def _job_audit_rate(job_obj: dict) -> float:
+    r = job_obj.get("audit_rate")
+    if r is None:
+        r = job_obj.get("challenge", {}).get("audit_rate")
+    if r is None:
+        r = GMF_AUDIT_DEFAULT_RATE
+    try:
+        r = float(r)
+    except Exception:
+        r = GMF_AUDIT_DEFAULT_RATE
+    if r < 0: r = 0.0
+    if r > 1: r = 1.0
+    return r
+
+def _audit_required(job_obj: dict) -> bool:
+    return random.random() < _job_audit_rate(job_obj)
+
+def _canon_json_bytes(obj) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+def _sha256_hex_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def _audit_bundle_path(proof_hash: str) -> Path:
+    d = Path(GMF_AUDIT_BUNDLE_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{proof_hash}.bin"
+
+def _write_audit_bundle(proof_hash: str, bundle_bytes: bytes) -> dict:
+    h = _sha256_hex_bytes(bundle_bytes)
+    path = _audit_bundle_path(proof_hash)
+    if not path.exists():
+        path.write_bytes(bundle_bytes)
+    meta = {
+        "kind": "gmf_audit_bundle_meta",
+        "version": 1,
+        "proof_hash": proof_hash,
+        "bundle_sha256": h,
+        "bytes": len(bundle_bytes),
+        "path": str(path),
+    }
+    (path.with_suffix(".meta.json")).write_bytes(_canon_json_bytes(meta))
+    return meta
+
+def _lease_challenge_put(db, lease_id: str, device_id: str, job_id: str, nonce_hex: str, audit_required: bool, required_fields: list[str], ts_utc: str):
+    rf = _csv_norm(",".join(required_fields))
+    row = db.query(LeaseChallenge).filter(LeaseChallenge.lease_id == lease_id).first()
+    if row is None:
+        row = LeaseChallenge(
+            lease_id=lease_id, device_id=device_id, job_id=job_id,
+            nonce_hex=nonce_hex, audit_required=1 if audit_required else 0,
+            required_fields_csv=rf, created_ts_utc=ts_utc,
+        )
+        db.add(row)
+    else:
+        row.nonce_hex = nonce_hex
+        row.audit_required = 1 if audit_required else 0
+        row.required_fields_csv = rf
+        row.created_ts_utc = ts_utc
+    db.commit()
+
+def _lease_challenge_get(db, lease_id: str):
+    return db.query(LeaseChallenge).filter(LeaseChallenge.lease_id == lease_id).first()

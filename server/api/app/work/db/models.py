@@ -69,3 +69,16 @@ class DeviceDaily(BaseWork):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 Index("ix_jobs_topic", Job.topic)
+
+
+class LeaseChallenge(Base):
+    __tablename__ = "lease_challenges"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    lease_id = Column(String, nullable=False, unique=True, index=True)
+    device_id = Column(String, nullable=False, index=True)
+    job_id = Column(String, nullable=False, index=True)
+    nonce_hex = Column(String, nullable=False)          # server-issued nonce
+    audit_required = Column(Integer, nullable=False, default=0)  # 0/1
+    required_fields_csv = Column(Text, nullable=False, default="")  # e.g. "lean_trace_hash"
+    created_ts_utc = Column(String, nullable=False)
+
