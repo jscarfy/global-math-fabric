@@ -640,6 +640,8 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
 
         let unit_id = task_work_unit_id(&task);
         let receipt_payload = serde_json::json!({
+        "receipt_id_sha256": "",
+
             "protocol": "gmf/ssr_payload/v1",
             "policy_id": policy_id,
             "device_id": device_id,
@@ -954,7 +956,20 @@ fn write_final_snapshot_once(
 
     let payload = compute_final_snapshot_payload(date)?;
     let canon = canonical_json_bytes(&payload);
-    let msg = sha2::Sha256::digest(&canon);
+    let msg = sha2::
+    // compute deterministic receipt_id_sha256 from payload core (exclude receipt_id_sha256 itself)
+    {
+        let mut core = receipt_payload.clone();
+        if let Some(obj) = core.as_object_mut() {
+            obj.remove("receipt_id_sha256");
+        }
+        let core_canon = canonical_json_bytes(&core);
+        let rid = sha256_hex_bytes(&core_canon);
+        if let Some(obj) = receipt_payload.as_object_mut() {
+            obj.insert("receipt_id_sha256".to_string(), serde_json::Value::String(rid));
+        }
+    }
+Sha256::digest(&canon);
     let sig_b64 = server_sign_fn(&msg);
 
     let env = serde_json::json!({
