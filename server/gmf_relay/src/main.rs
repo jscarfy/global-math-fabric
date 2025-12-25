@@ -79,8 +79,12 @@ struct Submission {
 struct AppState {
     tasks: Arc<Mutex<Vec<TaskSpec>>>,
     assigned: Arc<Mutex<HashMap<String, Lease>>>,      // lease_key "{task_id}::{device_id}"
-    completed: Arc<Mutex<HashSet<String>>>,
+    completed: Arc<Mutex<HashSet<String>>>,            // completed task_id
     submissions: Arc<Mutex<HashMap<String, Vec<Submission>>>>,
+
+    // anti-dup: work_unit_id -> owner task_id
+    unit_owner: Arc<Mutex<HashMap<String, String>>>,
+    completed_units: Arc<Mutex<HashSet<String>>>,
 }
 
 fn unix_now() -> u64 {
@@ -290,9 +294,7 @@ fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<Value> {
     let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned()
         .unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
     let cmd_vec: Vec<String> = cmd_arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-    if cmd_vec.is_empty() { return Err(anyhow::anyhow!("empty cmd")); }
 
-    // clone
     let dir = tempdir()?;
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo)?;
@@ -303,12 +305,10 @@ fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<Value> {
     run_cmd(Command::new("git").args(["checkout","FETCH_HEAD"]).current_dir(&repo))?;
 
     let workdir = if subdir.is_empty() { repo.clone() } else { repo.join(subdir) };
-    if !workdir.exists() { return Err(anyhow::anyhow!("subdir does not exist")); }
 
     let (git_rev, git_tree, lean_toolchain_sha256, lakefile_sha256, lake_manifest_sha256) = if require_source_hash {
         let git_rev = git_rev_parse(&repo, "HEAD")?;
         let git_tree = git_rev_parse(&repo, "HEAD^{tree}")?;
-
         let lean_toolchain_sha256 = sha256_file_hex(&workdir.join("lean-toolchain"))?;
         let lake_manifest_sha256 = sha256_file_hex(&workdir.join("lake-manifest.json"))?;
         let lakefile_sha256 = if workdir.join("Lakefile.lean").exists() {
@@ -316,86 +316,18 @@ fn spotcheck_lean(task: &TaskSpec) -> anyhow::Result<Value> {
         } else {
             sha256_file_hex(&workdir.join("lakefile.lean"))?
         };
-
         (git_rev, git_tree, lean_toolchain_sha256, lakefile_sha256, lake_manifest_sha256)
     } else {
         ("".into(),"".into(),"".into(),"".into(),"".into())
     };
 
     let mut partial = docker_build_and_hash(&repo, subdir, artifacts_root, docker_image, use_cache, &cmd_vec, require_artifact_hash)?;
-
-    if require_source_hash {
-        partial.as_object_mut().unwrap().insert("git_rev".into(), Value::String(git_rev));
-        partial.as_object_mut().unwrap().insert("git_tree".into(), Value::String(git_tree));
-        partial.as_object_mut().unwrap().insert("lean_toolchain_sha256".into(), Value::String(lean_toolchain_sha256));
-        partial.as_object_mut().unwrap().insert("lakefile_sha256".into(), Value::String(lakefile_sha256));
-        partial.as_object_mut().unwrap().insert("lake_manifest_sha256".into(), Value::String(lake_manifest_sha256));
-    } else {
-        partial.as_object_mut().unwrap().insert("git_rev".into(), Value::String("".into()));
-        partial.as_object_mut().unwrap().insert("git_tree".into(), Value::String("".into()));
-        partial.as_object_mut().unwrap().insert("lean_toolchain_sha256".into(), Value::String("".into()));
-        partial.as_object_mut().unwrap().insert("lakefile_sha256".into(), Value::String("".into()));
-        partial.as_object_mut().unwrap().insert("lake_manifest_sha256".into(), Value::String("".into()));
-    }
-
+    partial.as_object_mut().unwrap().insert("git_rev".into(), Value::String(git_rev));
+    partial.as_object_mut().unwrap().insert("git_tree".into(), Value::String(git_tree));
+    partial.as_object_mut().unwrap().insert("lean_toolchain_sha256".into(), Value::String(lean_toolchain_sha256));
+    partial.as_object_mut().unwrap().insert("lakefile_sha256".into(), Value::String(lakefile_sha256));
+    partial.as_object_mut().unwrap().insert("lake_manifest_sha256".into(), Value::String(lake_manifest_sha256));
     Ok(partial)
-}
-
-
-fn hard_gate_check(task: &TaskSpec, result_core: &Value) -> Option<String> {
-    let require_source_hash = task.params.get("require_source_hash").and_then(|v| v.as_bool()).unwrap_or(true);
-    if !require_source_hash { return None; }
-
-    // expected_git_rev/tree are required if present (hard-gate)
-    let exp_rev = task.params.get("expected_git_rev").and_then(|v| v.as_str());
-    let exp_tree = task.params.get("expected_git_tree").and_then(|v| v.as_str());
-
-    if let Some(er) = exp_rev {
-        let got = result_core.get("git_rev").and_then(|v| v.as_str()).unwrap_or("");
-        if got != er { return Some(format!("expected_git_rev mismatch: expected={er} got={got}")); }
-    }
-    if let Some(et) = exp_tree {
-        let got = result_core.get("git_tree").and_then(|v| v.as_str()).unwrap_or("");
-        if got != et { return Some(format!("expected_git_tree mismatch: expected={et} got={got}")); }
-    }
-
-    // optional file hard-gates
-    
-    // optional artifacts hard-gate
-    if task.params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true) {
-        if let Some(ev) = task.params.get("expected_artifacts_manifest_sha256").and_then(|v| v.as_str()) {
-            if !ev.is_empty() {
-                let got = result_core.get("artifacts_manifest_sha256").and_then(|v| v.as_str()).unwrap_or("");
-                if got != ev {
-                    return Some(format!("expected_artifacts_manifest_sha256 mismatch: expected={ev} got={got}"));
-                }
-            }
-        }
-    }
-for (ek, rk) in [
-        ("expected_lean_toolchain_sha256","lean_toolchain_sha256"),
-        ("expected_lakefile_sha256","lakefile_sha256"),
-        ("expected_lake_manifest_sha256","lake_manifest_sha256"),
-    ] {
-        if let Some(ev) = task.params.get(ek).and_then(|v| v.as_str()) {
-            if !ev.is_empty() {
-                let got = result_core.get(rk).and_then(|v| v.as_str()).unwrap_or("");
-                if got != ev {
-                    return Some(format!("{ek} mismatch: expected={ev} got={got}"));
-                }
-            }
-        }
-    }
-
-    // docker_image hard-gate (if task params specify it)
-    if let Some(di) = task.params.get("docker_image").and_then(|v| v.as_str()) {
-        let got = result_core.get("docker_image").and_then(|v| v.as_str()).unwrap_or("");
-        if got != di {
-            return Some(format!("docker_image mismatch: expected={di} got={got}"));
-        }
-    }
-
-    None
 }
 
 fn normalize_result_core(task: &TaskSpec, result_core: &Value) -> Value {
@@ -404,7 +336,6 @@ fn normalize_result_core(task: &TaskSpec, result_core: &Value) -> Value {
 
     let ok = result_core.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let exit_code = result_core.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(9999);
-
     let docker_image = result_core.get("docker_image").cloned().unwrap_or(Value::String("".into()));
 
     let mut obj = serde_json::json!({
@@ -414,24 +345,67 @@ fn normalize_result_core(task: &TaskSpec, result_core: &Value) -> Value {
     });
 
     if require_artifact_hash {
-        obj.as_object_mut().unwrap().insert("build_log_sha256".into(),
-            result_core.get("build_log_sha256").cloned().unwrap_or(Value::String("".into())));
-        obj.as_object_mut().unwrap().insert("artifacts_root".into(),
-            result_core.get("artifacts_root").cloned().unwrap_or(Value::String("".into())));
-        obj.as_object_mut().unwrap().insert("artifacts_count".into(),
-            result_core.get("artifacts_count").cloned().unwrap_or(Value::Number(0.into())));
-        obj.as_object_mut().unwrap().insert("artifacts_manifest_sha256".into(),
-            result_core.get("artifacts_manifest_sha256").cloned().unwrap_or(Value::String("".into())));
+        for k in ["build_log_sha256","artifacts_root","artifacts_count","artifacts_manifest_sha256"] {
+            obj.as_object_mut().unwrap().insert(k.into(), result_core.get(k).cloned().unwrap_or(Value::String("".into())));
+        }
     }
-
     if require_source_hash {
         for k in ["git_rev","git_tree","lean_toolchain_sha256","lakefile_sha256","lake_manifest_sha256"] {
-            obj.as_object_mut().unwrap().insert(k.into(),
-                result_core.get(k).cloned().unwrap_or(Value::String("".into())));
+            obj.as_object_mut().unwrap().insert(k.into(), result_core.get(k).cloned().unwrap_or(Value::String("".into())));
+        }
+    }
+    obj
+}
+
+fn hard_gate_check(task: &TaskSpec, result_core: &Value) -> Option<String> {
+    let require_source_hash = task.params.get("require_source_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+    if require_source_hash {
+        let exp_rev = task.params.get("expected_git_rev").and_then(|v| v.as_str());
+        let exp_tree = task.params.get("expected_git_tree").and_then(|v| v.as_str());
+        if let Some(er) = exp_rev {
+            let got = result_core.get("git_rev").and_then(|v| v.as_str()).unwrap_or("");
+            if got != er { return Some(format!("expected_git_rev mismatch: expected={er} got={got}")); }
+        }
+        if let Some(et) = exp_tree {
+            let got = result_core.get("git_tree").and_then(|v| v.as_str()).unwrap_or("");
+            if got != et { return Some(format!("expected_git_tree mismatch: expected={et} got={got}")); }
+        }
+        for (ek, rk) in [
+            ("expected_lean_toolchain_sha256","lean_toolchain_sha256"),
+            ("expected_lakefile_sha256","lakefile_sha256"),
+            ("expected_lake_manifest_sha256","lake_manifest_sha256"),
+        ] {
+            if let Some(ev) = task.params.get(ek).and_then(|v| v.as_str()) {
+                if !ev.is_empty() {
+                    let got = result_core.get(rk).and_then(|v| v.as_str()).unwrap_or("");
+                    if got != ev { return Some(format!("{ek} mismatch: expected={ev} got={got}")); }
+                }
+            }
         }
     }
 
-    obj
+    let require_artifact_hash = task.params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+    if require_artifact_hash {
+        if let Some(ev) = task.params.get("expected_artifacts_manifest_sha256").and_then(|v| v.as_str()) {
+            if !ev.is_empty() {
+                let got = result_core.get("artifacts_manifest_sha256").and_then(|v| v.as_str()).unwrap_or("");
+                if got != ev {
+                    return Some(format!("expected_artifacts_manifest_sha256 mismatch: expected={ev} got={got}"));
+                }
+            }
+        }
+    }
+
+    if let Some(di) = task.params.get("docker_image").and_then(|v| v.as_str()) {
+        let got = result_core.get("docker_image").and_then(|v| v.as_str()).unwrap_or("");
+        if got != di { return Some(format!("docker_image mismatch: expected={di} got={got}")); }
+    }
+
+    None
+}
+
+fn task_work_unit_id(task: &TaskSpec) -> String {
+    task.params.get("work_unit_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
 }
 
 async fn pull_task(state: axum::extract::State<AppState>, Json(req): Json<PullRequest>)
@@ -456,8 +430,26 @@ async fn pull_task(state: axum::extract::State<AppState>, Json(req): Json<PullRe
 
     assigned.retain(|_, lease| lease.expires_at_unix > now);
 
+    let mut unit_owner = state.unit_owner.lock().unwrap();
+    let completed_units = state.completed_units.lock().unwrap();
+
     for t in tasks.iter() {
         if completed.contains(&t.task_id) { continue; }
+
+        // anti-dup gating
+        let unit_id = task_work_unit_id(t);
+        if !unit_id.is_empty() {
+            if completed_units.contains(&unit_id) {
+                continue;
+            }
+            if let Some(owner_tid) = unit_owner.get(&unit_id) {
+                if owner_tid != &t.task_id {
+                    continue; // already claimed by a different task_id
+                }
+            } else {
+                unit_owner.insert(unit_id.clone(), t.task_id.clone()); // claim it
+            }
+        }
 
         let active = assigned.iter().filter(|(k, _)| k.starts_with(&(t.task_id.clone() + "::"))).count() as i64;
         if active >= t.replicas.max(1) { continue; }
@@ -512,16 +504,14 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     let task = tasks.iter().find(|t| t.task_id == task_id).cloned()
         .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "unknown task_id".into()))?;
 
-    
-    // HARD-GATE: reject mismatching source pins immediately
+    // HARD-GATE reject
     if let Some(reason) = hard_gate_check(&task, &result_core) {
-        // append a 0-credit SSR for auditability, then reject (422)
         let policy_path = PathBuf::from(env::var("GMF_POLICY_PATH").unwrap_or_else(|_| "protocol/credits/v1/CREDITS_POLICY.md".into()));
         let policy_id = read_policy_id(&policy_path).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
         let server_sk_b64 = env::var("GMF_SERVER_SK_B64")
             .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing GMF_SERVER_SK_B64".into()))?;
 
+        let unit_id = task_work_unit_id(&task);
         let receipt_payload = serde_json::json!({
             "protocol": "gmf/ssr_payload/v1",
             "policy_id": policy_id,
@@ -529,8 +519,7 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
             "task_id": task.task_id,
             "task_kind": task.kind,
             "task_params": task.params,
-            "result_agreement_hash": "",
-            "replica_winners": [],
+            "work_unit_id": unit_id,
             "credits_delta_micro": 0,
             "reason_code": "rejected_expected_source_mismatch",
             "fraud_flag": false,
@@ -542,30 +531,18 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
             sign_ssr(&server_sk_b64, &receipt_payload)
                 .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let ssr = ServerSignedReceipt{
-            protocol: "gmf/ssr/v1".into(),
-            receipt_payload,
-            server_pubkey_b64,
-            server_sig_b64,
-        };
+        let ssr = ServerSignedReceipt{ protocol: "gmf/ssr/v1".into(), receipt_payload, server_pubkey_b64, server_sig_b64 };
         append_ssr(&ssr)?;
-        // return SSR JSON as the error body so worker can log/store it
         return Err((axum::http::StatusCode::UNPROCESSABLE_ENTITY, serde_json::to_string(&ssr).unwrap()));
     }
 
+    // collect submissions
     let mut subs_map = state.submissions.lock().unwrap();
-
     let subs = subs_map.entry(task.task_id.clone()).or_insert_with(Vec::new);
-
     if subs.iter().any(|s| s.device_id == device_id) {
         return Err((axum::http::StatusCode::CONFLICT, "duplicate submission".into()));
     }
-
-    subs.push(Submission{
-        device_id: device_id.clone(),
-        result_core: result_core.clone(),
-        received_at: Utc::now().to_rfc3339(),
-    });
+    subs.push(Submission{ device_id: device_id.clone(), result_core: result_core.clone(), received_at: Utc::now().to_rfc3339() });
 
     let needed = task.replicas.max(1) as usize;
     if subs.len() < needed {
@@ -587,33 +564,35 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
         .find(|(_, devs)| devs.len() >= needed)
         .ok_or_else(|| (axum::http::StatusCode::CONFLICT, "no agreement among replicas".into()))?;
 
-    // decide spot-check
+    // spot-check
     let rate: f64 = env::var("GMF_SPOTCHECK_RATE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.01);
     let do_spot = rand::thread_rng().gen::<f64>() < rate;
     let mut spot = serde_json::json!({"performed": do_spot});
-
     let mut spot_result_core: Option<Value> = None;
+
     if do_spot && task.kind == "lean_check" {
         match spotcheck_lean(&task) {
-            Ok(rcore) => {
-                spot["result_core"] = rcore.clone();
-                spot_result_core = Some(rcore);
-            }
-            Err(e) => {
-                spot["inconclusive"] = Value::Bool(true);
-                spot["error"] = Value::String(e.to_string());
-            }
+            Ok(rcore) => { spot["result_core"] = rcore.clone(); spot_result_core = Some(rcore); }
+            Err(e) => { spot["inconclusive"] = Value::Bool(true); spot["error"] = Value::String(e.to_string()); }
         }
     }
 
-    // mark completed
-    let mut completed = state.completed.lock().unwrap();
-    completed.insert(task.task_id.clone());
+    // mark completed (task + unit)
+    {
+        let mut completed = state.completed.lock().unwrap();
+        completed.insert(task.task_id.clone());
+    }
+    let unit_id = task_work_unit_id(&task);
+    if !unit_id.is_empty() {
+        let mut cu = state.completed_units.lock().unwrap();
+        cu.insert(unit_id.clone());
+    }
 
     let per_device = (task.credit_micro_total / task.replicas.max(1)) as i64;
 
-    // fraud compare: normalized(spot) vs normalized(agreed exemplar)
-    let agreed_exemplar = exemplar_by_hash.get(&agree_hash).cloned().unwrap_or_else(|| normalize_result_core(&task, &result_core));
+    let agreed_exemplar = exemplar_by_hash.get(&agree_hash).cloned()
+        .unwrap_or_else(|| normalize_result_core(&task, &result_core));
+
     let fraud = if let Some(spot_core) = spot_result_core.as_ref() {
         let b = normalize_result_core(&task, spot_core);
         agreed_exemplar != b
@@ -627,6 +606,11 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
     let server_sk_b64 = env::var("GMF_SERVER_SK_B64")
         .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing GMF_SERVER_SK_B64".into()))?;
 
+    let unit_owner_task_id = {
+        let uo = state.unit_owner.lock().unwrap();
+        uo.get(&unit_id).cloned().unwrap_or("".into())
+    };
+
     let issue_for = |dev_id: &str, delta: i64, reason: &str, fraud_flag: bool|
         -> Result<ServerSignedReceipt, (axum::http::StatusCode, String)> {
         let receipt_payload = serde_json::json!({
@@ -636,6 +620,8 @@ async fn submit_task(state: axum::extract::State<AppState>, Json(req): Json<Subm
             "task_id": task.task_id,
             "task_kind": task.kind,
             "task_params": task.params,
+            "work_unit_id": unit_id,
+            "unit_owner_task_id": unit_owner_task_id,
             "result_agreement_hash": agree_hash,
             "replica_winners": winners,
             "credits_delta_micro": delta,
@@ -687,6 +673,8 @@ async fn main() -> anyhow::Result<()> {
         assigned: Arc::new(Mutex::new(HashMap::new())),
         completed: Arc::new(Mutex::new(HashSet::new())),
         submissions: Arc::new(Mutex::new(HashMap::new())),
+        unit_owner: Arc::new(Mutex::new(HashMap::new())),
+        completed_units: Arc::new(Mutex::new(HashSet::new())),
     };
 
     let app = Router::new()
