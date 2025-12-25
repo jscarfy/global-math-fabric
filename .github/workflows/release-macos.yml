@@ -1,0 +1,80 @@
+name: release-macos
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Compute version from tag
+        shell: bash
+        run: |
+          MSIX_VERSION=$(./scripts/release/version_from_tag.sh "${GITHUB_REF_NAME}")
+          echo "MSIX_VERSION=${MSIX_VERSION}" >> $GITHUB_ENV
+
+      - name: Import Developer ID cert (P12) into keychain
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MACOS_DEVID_P12_B64 }}
+          p12-password: ${{ secrets.MACOS_DEVID_P12_PASSWORD }}
+
+      - name: Build macOS app (Flutter)
+        shell: bash
+        run: |
+          cd clients/gmf_mobile_flutter
+          flutter pub get
+          flutter build macos --release
+
+      - name: Codesign .app (Hardened Runtime)
+        shell: bash
+        run: |
+          APP="clients/gmf_mobile_flutter/build/macos/Build/Products/Release"/*.app
+          echo "APP=$APP"
+          # pick first Developer ID Application identity
+          SIGN_ID="$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n 1)"
+          if [ -z "$SIGN_ID" ]; then
+            echo "ERROR: no Developer ID Application identity found in keychain" 1>&2
+            security find-identity -v -p codesigning || true
+            exit 2
+          fi
+          echo "Using SIGN_ID=$SIGN_ID"
+          codesign --force --deep --options runtime --timestamp --sign "$SIGN_ID" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Package DMG
+        shell: bash
+        run: |
+          mkdir -p dist/updates/macos
+          APP="clients/gmf_mobile_flutter/build/macos/Build/Products/Release"/*.app
+          DMG="dist/updates/macos/gmf-macos.dmg"
+          hdiutil create -volname "Global Math Fabric" -srcfolder "$APP" -ov -format UDZO "$DMG"
+          ls -lh "$DMG"
+
+      - name: Notarize DMG (notarytool --wait) + Staple
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          DMG="dist/updates/macos/gmf-macos.dmg"
+          # Submit & wait (Apple-recommended)
+          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          # Staple ticket
+          xcrun stapler staple "$DMG"
+          # Basic assessment
+          spctl -a -t open --verbose=2 "$DMG" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/updates/macos/gmf-macos.dmg
