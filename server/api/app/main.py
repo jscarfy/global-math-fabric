@@ -965,3 +965,58 @@ def ledger_receipt_proof(receipt_id: str):
         "proof": proof,
         "checkpoint": cp
     }
+
+
+@app.get("/ledger/receipt/proof_bundle")
+def ledger_receipt_proof_bundle(receipt_id: str):
+    """
+    Returns a self-contained verification bundle:
+      - receipt envelope (key_id, payload_b64, signature_b64)
+      - decoded receipt payload
+      - governance rules + sigset + guardian_set
+      - inclusion proof + anchor checkpoint (if any)
+    Anyone can verify offline.
+    """
+    db = SessionLocal()
+    try:
+        r = db.query(Receipt).filter(Receipt.receipt_id == receipt_id).first()
+        if not r:
+            return {"ok": False, "error": "unknown_receipt_id"}
+
+        envelope = {
+            "key_id": str(r.key_id),
+            "payload_b64": str(r.payload_b64),
+            "signature_b64": str(r.signature_b64),
+        }
+
+        # decoded payload (best-effort)
+        payload = None
+        try:
+            import base64, json as _json
+            msg = base64.b64decode(envelope["payload_b64"].encode("ascii"))
+            payload = _json.loads(msg.decode("utf-8"))
+        except Exception:
+            payload = None
+
+        proof_obj = ledger_receipt_proof(receipt_id)  # reuse endpoint logic
+        if not proof_obj.get("ok"):
+            return {"ok": False, "error": "proof_failed", "detail": proof_obj}
+
+        bundle = {
+            "bundle_v": 1,
+            "receipt_id": receipt_id,
+            "envelope": envelope,
+            "payload": payload,
+            "governance": {
+                "rules_version": GMF_GOV["rules_version"],
+                "rules_sha256": GMF_GOV["rules_sha256"],
+                "guardian_set_id": GMF_GOV["guardian_set_id"],
+                "rules": GMF_GOV["rules"],
+                "sigset": GMF_GOV["sigset"],
+                "guardian_set": GMF_GOV["guardian_set"],
+            },
+            "inclusion": proof_obj,
+        }
+        return {"ok": True, "bundle": bundle}
+    finally:
+        db.close()
