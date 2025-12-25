@@ -6,6 +6,8 @@ import 'platform_runner.dart';
 import 'device_register.dart';
 import 'account_store.dart';
 import 'account_api.dart';
+import 'resource_limits_store.dart';
+import 'consent_store.dart';
 
 class GmfSettingsPage extends StatefulWidget {
   const GmfSettingsPage({super.key});
@@ -33,9 +35,12 @@ class _GmfSettingsPageState extends State<GmfSettingsPage> {
     final baseUrl = await AccountStore.getBaseUrl();
     final token = await AccountStore.getToken();
     final accountId = await AccountStore.getAccountId();
+    final limits = await ResourceLimitsStore.get();
     _baseUrlCtl.text = baseUrl;
 
     setState(() {
+      _limits = limits;
+
       _baseUrl = baseUrl;
       _token = token;
       _accountId = accountId;
@@ -127,7 +132,61 @@ class _GmfSettingsPageState extends State<GmfSettingsPage> {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: ElevatedButton(onPressed: _saveBaseUrl, child: const Text('Save Base URL')),
           ),
+          
           const Divider(),
+          ListTile(title: const Text('Resource Limits')),
+          SwitchListTile(
+            title: const Text('Charging only'),
+            value: _limits.chargingOnly,
+            onChanged: (v) async {
+              final n = ResourceLimits(chargingOnly: v, unmeteredOnly: _limits.unmeteredOnly, cpuCapPercent: _limits.cpuCapPercent);
+              await ResourceLimitsStore.set(n);
+              setState(() => _limits = n);
+            },
+          ),
+          SwitchListTile(
+            title: const Text('Wi-Fi / unmetered only'),
+            value: _limits.unmeteredOnly,
+            onChanged: (v) async {
+              final n = ResourceLimits(chargingOnly: _limits.chargingOnly, unmeteredOnly: v, cpuCapPercent: _limits.cpuCapPercent);
+              await ResourceLimitsStore.set(n);
+              setState(() => _limits = n);
+            },
+          ),
+          ListTile(
+            title: const Text('CPU cap (soft)'),
+            subtitle: Text('${_limits.cpuCapPercent}%'),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Slider(
+              value: _limits.cpuCapPercent.toDouble(),
+              min: 5,
+              max: 100,
+              divisions: 19,
+              label: '${_limits.cpuCapPercent}%',
+              onChanged: (v) async {
+                final n = ResourceLimits(chargingOnly: _limits.chargingOnly, unmeteredOnly: _limits.unmeteredOnly, cpuCapPercent: v.round());
+                await ResourceLimitsStore.set(n);
+                setState(() => _limits = n);
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: ElevatedButton(
+              onPressed: () async {
+                await ConsentStore.revoke();
+                await PlatformRunner.stopBackground();
+                if (context.mounted) {
+                  setState(() => _bgOn = false);
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Consent revoked. Background stopped.')));
+                }
+              },
+              child: const Text('Revoke Consent + Stop Background'),
+            ),
+          ),
+
           ListTile(title: const Text('Account')),
           if (_accountId != null) Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
