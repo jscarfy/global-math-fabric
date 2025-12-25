@@ -25,6 +25,7 @@ from app.crypto.receipt import sign_receipt, now_iso
 from app.crypto.governance import load_governance_or_die
 from app.crypto import ledger as ledger_mod
 from app.crypto import checkpointing
+from app.work.routes import router as work_router
 from app.crypto import amendments
 from app.crypto import merkle as merkle_mod
 from app.schemas.receipt import ReceiptEnvelope
@@ -1205,3 +1206,7 @@ def governance_rules_amendments_get(name: str):
         return {"ok": True, "path": path, "amendment": obj}
     except Exception as e:
         return {"ok": False, "error": "failed_to_load", "path": path, "detail": str(e)}
+
+
+# Work API
+app.include_router(work_router)
