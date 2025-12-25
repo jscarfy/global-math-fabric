@@ -26,6 +26,7 @@ from app.crypto.governance import load_governance_or_die
 from app.crypto import ledger as ledger_mod
 from app.crypto import checkpointing
 from app.work.routes import router as work_router
+from app.devices.routes import router as devices_router
 from app.credits import router as credits_router
 from app.enroll import router as enroll_router
 from app.policy import router as policy_router
@@ -1214,6 +1215,7 @@ def governance_rules_amendments_get(name: str):
 
 # Work API
 app.include_router(work_router)
+app.include_router(devices_router)
 
 # Credits API
 app.include_router(credits_router)
