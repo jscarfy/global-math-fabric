@@ -130,7 +130,7 @@ def main():
                 raise SystemExit(f"missing kind for task_id={tid}")
 
             params = obj.get("params") or {}
-            if kind in ("lean_check","receipt_verify","ledger_audit","final_verify","audit_final_verify","report_verify"):
+            if kind in ("lean_check","receipt_verify","ledger_audit","final_verify","audit_final_verify","report_verify","canonical_export_verify"):
                 # compute work_unit_id for anti-dup scheduler
                 unit_id = compute_work_unit_id(kind, params)
                 params["work_unit_id"] = unit_id
