@@ -1152,3 +1152,206 @@ def _make_rw_eq_job_v1() -> dict:
         {"t":"*","a":[{"t":"v","n":"y"},{"t":"v","n":"y"}]},
     ]}
     return {"kind":"rw_eq_v1","theory":"ring_lite_v1","start":start,"goal":goal,"max_steps":400,"max_nodes":4000}
+
+
+def _rw_nodes(expr):
+    if not isinstance(expr, dict): return 0
+    t = expr.get("t")
+    if t in ("c","v"): return 1
+    if t in ("+","*"):
+        a = expr.get("a") or []
+        return 1 + sum(_rw_nodes(x) for x in a)
+    return 1
+
+def _rw_canon_key(expr):
+    t = expr.get("t")
+    if t=="c": return f"c:{int(expr.get('v',0))}"
+    if t=="v": return f"v:{expr.get('n','')}"
+    if t in ("+","*"):
+        ks = [_rw_canon_key(x) for x in (expr.get("a") or [])]
+        ks.sort()
+        return f"{t}(" + ",".join(ks) + ")"
+    return "?"
+
+def _rw_apply_local_rule(sub, rule):
+    t = sub.get("t")
+
+    if rule=="add_flatten" and t=="+":
+        outa=[]; changed=False
+        for x in (sub.get("a") or []):
+            if isinstance(x, dict) and x.get("t")=="+": outa.extend(x.get("a") or []); changed=True
+            else: outa.append(x)
+        if changed: sub["a"]=outa
+        return True if changed else False
+
+    if rule=="mul_flatten" and t=="*":
+        outa=[]; changed=False
+        for x in (sub.get("a") or []):
+            if isinstance(x, dict) and x.get("t")=="*": outa.extend(x.get("a") or []); changed=True
+            else: outa.append(x)
+        if changed: sub["a"]=outa
+        return True if changed else False
+
+    if rule=="mul_annihilate0" and t=="*":
+        for x in (sub.get("a") or []):
+            if isinstance(x,dict) and x.get("t")=="c" and int(x.get("v",0))==0:
+                return {"t":"c","v":0}
+        return False
+
+    if rule=="add_foldconst" and t=="+":
+        s=0; outa=[]; seen=False
+        for x in (sub.get("a") or []):
+            if isinstance(x,dict) and x.get("t")=="c":
+                s += int(x.get("v",0)); seen=True
+            else:
+                outa.append(x)
+        if seen: outa.append({"t":"c","v":s})
+        sub["a"]=outa
+        return True if seen else False
+
+    if rule=="mul_foldconst" and t=="*":
+        prod=1; outa=[]; seen=False
+        for x in (sub.get("a") or []):
+            if isinstance(x,dict) and x.get("t")=="c":
+                prod *= int(x.get("v",1)); seen=True
+            else:
+                outa.append(x)
+        if seen: outa.append({"t":"c","v":prod})
+        sub["a"]=outa
+        return True if seen else False
+
+    if rule=="add_drop0" and t=="+":
+        a = [x for x in (sub.get("a") or []) if not (isinstance(x,dict) and x.get("t")=="c" and int(x.get("v",0))==0)]
+        if len(a)==0: return {"t":"c","v":0}
+        if len(a)==1: return a[0]
+        sub["a"]=a
+        return True
+
+    if rule=="mul_drop1" and t=="*":
+        a = [x for x in (sub.get("a") or []) if not (isinstance(x,dict) and x.get("t")=="c" and int(x.get("v",1))==1)]
+        if len(a)==0: return {"t":"c","v":1}
+        if len(a)==1: return a[0]
+        sub["a"]=a
+        return True
+
+    if rule=="distribute_left" and t=="*":
+        a = sub.get("a") or []
+        if len(a)!=2: return False
+        A,B = a[0],a[1]
+        if isinstance(B,dict) and B.get("t")=="+":
+            terms=B.get("a") or []
+            return {"t":"+","a":[{"t":"*","a":[A, t]} for t in terms]}
+        return False
+
+    if rule=="distribute_right" and t=="*":
+        a = sub.get("a") or []
+        if len(a)!=2: return False
+        B,A = a[0],a[1]
+        if isinstance(B,dict) and B.get("t")=="+":
+            terms=B.get("a") or []
+            return {"t":"+","a":[{"t":"*","a":[t, A]} for t in terms]}
+        return False
+
+    if rule=="add_sort" and t=="+":
+        a = sub.get("a") or []
+        before=[_rw_canon_key(x) for x in a]
+        a.sort(key=_rw_canon_key)
+        after=[_rw_canon_key(x) for x in a]
+        sub["a"]=a
+        return True if before!=after else False
+
+    if rule=="mul_sort" and t=="*":
+        a = sub.get("a") or []
+        before=[_rw_canon_key(x) for x in a]
+        a.sort(key=_rw_canon_key)
+        after=[_rw_canon_key(x) for x in a]
+        sub["a"]=a
+        return True if before!=after else False
+
+    return False
+
+def _rw_get_at(expr, path):
+    cur = expr
+    for i in path:
+        a = cur.get("a") or []
+        if int(i) < 0 or int(i) >= len(a): return None
+        cur = a[int(i)]
+    return cur
+
+def _rw_set_at(expr, path, new_sub):
+    if not path: return new_sub
+    cur = expr
+    for i in path[:-1]:
+        a = cur.get("a") or []
+        cur = a[int(i)]
+    a = cur.get("a") or []
+    a[int(path[-1])] = new_sub
+    cur["a"] = a
+    return expr
+
+def _rw_normalize_one_pass(expr, path, max_nodes, rules):
+    # post-order traversal, stop at first change
+    t = expr.get("t")
+    if t in ("+","*"):
+        a = expr.get("a") or []
+        for i in range(len(a)):
+            path.append(i)
+            changed = _rw_normalize_one_pass(a[i], path, max_nodes, rules)
+            path.pop()
+            if changed: return True
+            if _rw_nodes(expr) > max_nodes: return False
+
+    for r in rules:
+        sub = _rw_get_at(expr, path)
+        if sub is None or not isinstance(sub, dict): return False
+        before = dict(sub)  # shallow; ok because we only use for revert on explode
+        applied = _rw_apply_local_rule(sub, r)
+        if applied is False:
+            continue
+        if isinstance(applied, dict):
+            expr = _rw_set_at(expr, path, applied)
+        if _rw_nodes(expr) > max_nodes:
+            # revert best-effort (path-local)
+            expr = _rw_set_at(expr, path, before)
+            return False
+        return True
+    return False
+
+def _rw_normalize(expr, max_steps, max_nodes):
+    rules = ["add_flatten","mul_flatten","mul_annihilate0","add_foldconst","mul_foldconst","add_drop0","mul_drop1",
+             "distribute_left","distribute_right","add_sort","mul_sort"]
+    cur = expr
+    for _ in range(max_steps):
+        path=[]
+        if _rw_nodes(cur) > max_nodes: break
+        changed = _rw_normalize_one_pass(cur, path, max_nodes, rules)
+        if not changed: break
+    return cur
+
+def _make_rw_eq_job_v1(seed_hex=None) -> dict:
+    # seeded random start; goal = deterministic normalize(start)
+    if seed_hex is None:
+        seed_hex = hashlib.sha256(os.urandom(32)).hexdigest()
+    seed = int(seed_hex[:16], 16)
+    rng = random.Random(seed)
+
+    vars_ = ["x","y","z"]
+    def rv():
+        return {"t":"v","n": rng.choice(vars_)}
+    def rc():
+        return {"t":"c","v": rng.choice([0,1,2,3,-1])}
+    def rsum(k):
+        return {"t":"+","a":[rv() if rng.random()<0.7 else rc() for _ in range(k)]}
+    def rprod(k):
+        return {"t":"*","a":[rv() if rng.random()<0.7 else rc() for _ in range(k)]}
+
+    # start: (* (sum2) (sum2)) or (* (prod2) (sum3)) etc
+    if rng.random() < 0.6:
+        start = {"t":"*","a":[rsum(rng.choice([2,3])), rsum(rng.choice([2,3]))]}
+    else:
+        start = {"t":"*","a":[rprod(2), rsum(3)]}
+
+    max_steps = 600
+    max_nodes  = 6000
+    goal = _rw_normalize(start, max_steps, max_nodes)
+    return {"kind":"rw_eq_v1","theory":"ring_lite_v1","start":start,"goal":goal,"max_steps":max_steps,"max_nodes":max_nodes, "seed_hex": seed_hex}
