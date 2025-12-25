@@ -10,6 +10,8 @@ use gmf_receipts::{jcs_canonicalize, sha256, sha256_hex};
 
 #[derive(Debug, Deserialize)]
 struct ClaimEnvelope {
+    consent_token_json: Option<String>,
+
     protocol: String,                 // "gmf/receipt/v1"
     claim_payload: Value,             // payload to canonicalize+hash
     device_pubkey_b64: String,
@@ -49,6 +51,32 @@ fn verify_claim(claim: &ClaimEnvelope) -> anyhow::Result<String> {
     Ok(hex::encode(msg))
 }
 
+
+fn verify_consent(consent_token_json: &str, device_pubkey_b64: &str, device_id_expected: &str) -> anyhow::Result<()> {
+    let token_v: serde_json::Value = serde_json::from_str(consent_token_json)?;
+    let payload = token_v.get("consent_payload").ok_or_else(|| anyhow::anyhow!("missing consent_payload"))?;
+    let sig_b64 = token_v.get("device_sig_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing device_sig_b64"))?;
+
+    // check device_id matches
+    let device_id = payload.get("device_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing device_id"))?;
+    if device_id != device_id_expected {
+        return Err(anyhow::anyhow!("device_id mismatch"));
+    }
+
+    // verify signature over sha256(JCS(payload)) — for MVP we reuse our Rust JCS canonicalizer (same idea as RFC8785)
+    let canon = jcs_canonicalize(payload);
+    let msg = sha256(&canon);
+
+    let pk_bytes = B64.decode(device_pubkey_b64)?;
+    let pk = VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| anyhow::anyhow!("bad pk"))?)
+        .map_err(|_| anyhow::anyhow!("bad pk parse"))?;
+
+    let sig_bytes = B64.decode(sig_b64)?;
+    let sig = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| anyhow::anyhow!("bad sig"))?);
+    pk.verify(&msg, &sig).map_err(|_| anyhow::anyhow!("consent signature invalid"))?;
+    Ok(())
+}
+
 fn device_id_from_pubkey_b64(pubkey_b64: &str) -> anyhow::Result<String> {
     let pk_bytes = B64.decode(pubkey_b64)?;
     Ok(sha256_hex(&pk_bytes))
@@ -71,7 +99,14 @@ async fn post_claim(Json(claim): Json<ClaimEnvelope>) -> Result<Json<ServerSigne
     let device_id = device_id_from_pubkey_b64(&claim.device_pubkey_b64)
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
 
+    
+    // consent required
+    let consent = claim.consent_token_json.as_deref().ok_or_else(|| (axum::http::StatusCode::FORBIDDEN, "missing consent token".into()))?;
+    verify_consent(consent, &claim.device_pubkey_b64, &device_id)
+        .map_err(|e| (axum::http::StatusCode::FORBIDDEN, e.to_string()))?;
+
     let credits = compute_credits_micro(&claim.claim_payload);
+
 
     let server_sk_b64 = env::var("GMF_SERVER_SK_B64").map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing GMF_SERVER_SK_B64".into()))?;
     let sk_bytes = B64.decode(&server_sk_b64).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
