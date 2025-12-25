@@ -1450,6 +1450,38 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // auto-finalize yesterday meta_audit_final after meta_audit log quiet for grace seconds (UTC)
+    let meta_finalize_grace_secs: u64 = env::var("GMF_META_AUDIT_FINALIZE_GRACE_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(900);
+    let meta_finalize_interval_secs: u64 = env::var("GMF_META_AUDIT_FINALIZE_INTERVAL_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(60);
+
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        loop {
+            let now = Utc::now();
+            let y = now - chrono::Duration::days(1);
+            let date = format!("{:04}-{:02}-{:02}", y.year(), y.month(), y.day());
+
+            let lp = meta_audit_path(&date);
+            let mf = meta_audit_final_path(&date);
+
+            if lp.exists() && !mf.exists() {
+                if let Ok(md) = std::fs::metadata(&lp) {
+                    if let Ok(mtime) = md.modified() {
+                        if let Ok(elapsed) = mtime.elapsed() {
+                            if elapsed.as_secs() >= meta_finalize_grace_secs {
+                                let _ = write_meta_audit_final_once(&date);
+                            }
+                        }
+                    }
+                }
+            }
+            sleep(Duration::from_secs(meta_finalize_interval_secs)).await;
+        }
+    });
+
+
 
 
     let app = Router::new()
