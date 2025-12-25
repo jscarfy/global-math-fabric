@@ -12,6 +12,44 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: 'stable'
+      - name: Decode MSIX signing cert (PFX) from GitHub Secret
+        shell: bash
+        env:
+          MSIX_PFX_B64: ${{ secrets.MSIX_PFX_B64 }}
+          MSIX_PFX_PASSWORD: ${{ secrets.MSIX_PFX_PASSWORD }}
+        run: |
+          mkdir -p certs
+          echo "$MSIX_PFX_B64" | base64 -d > certs/gmf_ci.pfx
+          echo "MSIX_PFX_PASSWORD=$MSIX_PFX_PASSWORD" >> $GITHUB_ENV
+
+      - name: Patch msix signing fields + msix_version
+        shell: bash
+        run: |
+          cd clients/gmf_mobile_flutter
+          python3 - <<'P'
+from pathlib import Path
+import re, os
+msix=os.environ.get('MSIX_VERSION','0.0.0.0')
+p=Path('pubspec.yaml')
+s=p.read_text()
+
+def set_or_insert(key, val):
+    global s
+    if re.search(rf'^\s*{key}\s*:', s, flags=re.M):
+        s=re.sub(rf'^\s*{key}\s*:.*$', f'  {key}: {val}', s, flags=re.M)
+    else:
+        s=re.sub(r'(msix_config:\s*\n)', r'\1  '+key+': '+val+'\n', s, count=1)
+
+# msix_version (4-part)
+set_or_insert('msix_version', msix)
+# signing fields (CI temp file)
+set_or_insert('certificate_path', '"../../certs/gmf_ci.pfx"')
+set_or_insert('certificate_password', '"${MSIX_PFX_PASSWORD}"')
+
+p.write_text(s)
+print("patched msix_version/cert fields")
+P
+
       - run: |
           cd clients/gmf_mobile_flutter
           flutter pub get
@@ -110,6 +148,27 @@ P
           else
             echo "No Sparkle generate_appcast; keeping releases/appcast.xml as-is"
           fi
+
+
+      - name: Update landing page from latest GitHub Release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          export PAGES_BASE=""  # computed inside script
+          export HAVE_RELEASE=1
+          export LATEST_JSON=/tmp/latest_release.json
+          export ANDROID_LINK="$(grep -v '^\s*#' releases/android_play_link.txt 2>/dev/null | head -n 1 || true)"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/latest" > "$LATEST_JSON" || echo "{}" > "$LATEST_JSON"
+          ./scripts/release/update_landing_from_latest_release.sh
+
+      - name: Commit landing page + BuildConfig back to repo
+        run: |
+          git config user.name "gmf-bot"
+          git config user.email "gmf-bot@users.noreply.github.com"
+          git add releases/index.html clients/gmf_mobile_flutter/lib/gmf/build_config.dart || true
+          git commit -m "release: refresh landing page for ${GITHUB_REF_NAME}" || true
+          git push || true
 
       - name: Commit appcast.xml back to repo
         run: |
