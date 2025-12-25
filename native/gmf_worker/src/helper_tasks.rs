@@ -241,10 +241,16 @@ async fn fetch_delta_once(relay_base: &str, date: &str, since_unix_ms: i64, max_
 
 pub async fn run_ledger_audit(relay_base: &str, params: &Value) -> Result<Value> {
     let date = params.get("date").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing params.date"))?;
+
+    let mode_str = params.get("mode").and_then(|v| v.as_str()).unwrap_or("delta");
+    let reset_cursor = params.get("reset_cursor").and_then(|v| v.as_bool()).unwrap_or(false);
+    let cursor_key = format!("{}|{}|{}", relay_base, date, "ledger_audit");
+
     let top_n = params.get("top_n").and_then(|v| v.as_i64()).unwrap_or(1000).max(1) as usize;
     let endpoint = params.get("ledger_endpoint").and_then(|v| v.as_str())
         .unwrap_or(&format!("/v1/ledger/ssr/{date}"));
-    let url_endpoint = params.get("ledger_endpoint").and_then(|v| v.as_str())
+        if mode_str == "full" {
+let url_endpoint = params.get("ledger_endpoint").and_then(|v| v.as_str())
         .unwrap_or(&format!("/v1/ledger/ssr/{date}"));
 
     let mut total = 0i64;
@@ -310,7 +316,88 @@ pub async fn run_ledger_audit(relay_base: &str, params: &Value) -> Result<Value>
     let lb_bytes = jcs_canonicalize(&leaderboard);
     let lb_digest = sha256_hex(&lb_bytes);
 
-    Ok(serde_json::json!({
+    
+    } else {
+        // DELTA MODE: aggregate credits from new SSR lines only
+        let mut cur = load_cursor();
+        if reset_cursor { cur.entries.remove(&cursor_key); }
+        let ent = cur.entries.entry(cursor_key.clone()).or_insert_with(|| HelperCursorEntry{ last_ts_unix_ms: 0, seen_hashes_at_last_ts: vec![] });
+
+        let mut seen: HashSet<String> = ent.seen_hashes_at_last_ts.iter().cloned().collect();
+        let mut since = ent.last_ts_unix_ms;
+        let max_lines = params.get("max_lines").and_then(|v| v.as_i64()).unwrap_or(3000).clamp(1, 50000) as usize;
+
+        let mut delta_total = 0i64;
+        let mut delta_credits: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut loops = 0u32;
+        let mut may_have_more = false;
+
+        loop {
+            loops += 1;
+            if loops > 50 { break; }
+
+            let (txt, last_ts_hdr, more) = fetch_delta_once(relay_base, date, since, max_lines).await?;
+            may_have_more = more;
+
+            for ln in txt.lines() {
+                let t = ln.trim();
+                if t.is_empty() { continue; }
+                delta_total += 1;
+
+                let v: Value = match serde_json::from_str(t) { Ok(x) => x, Err(_) => continue };
+                let ts = extract_ts_unix_ms_from_ssr(&v);
+                let h = line_hash_hex(t);
+
+                if ts == ent.last_ts_unix_ms && seen.contains(&h) {
+                    continue;
+                }
+                if ts > ent.last_ts_unix_ms {
+                    ent.last_ts_unix_ms = ts;
+                    seen.clear();
+                }
+                if ts == ent.last_ts_unix_ms {
+                    seen.insert(h.clone());
+                }
+
+                let payload = match v.get("receipt_payload") { Some(p) => p, None => continue };
+                let dev = match payload.get("device_id").and_then(|x| x.as_str()) { Some(d) => d, None => continue };
+                let delta = payload.get("credits_delta_micro").and_then(|x| x.as_i64()).unwrap_or(0);
+                *delta_credits.entry(dev.to_string()).or_insert(0) += delta;
+            }
+
+            if last_ts_hdr > since { since = last_ts_hdr; }
+            if !may_have_more || txt.trim().is_empty() { break; }
+        }
+
+        ent.seen_hashes_at_last_ts = seen.iter().take(5000).cloned().collect();
+        save_cursor(&cur)?;
+
+        let credits_devices = delta_credits.len() as i64;
+        let credits_total_micro: i64 = delta_credits.values().sum();
+
+        let mut snapshot_sha256 = None;
+        if let Ok(snap) = fetch_snapshot_json(relay_base, date).await {
+            if let Some(h) = snap.get("ssr_sha256").and_then(|v| v.as_str()) {
+                snapshot_sha256 = Some(h.to_string());
+            }
+        }
+
+        return Ok(serde_json::json!({
+            "ok": true,
+        "mode": "full",
+            "exit_code": 0,
+            "mode": "delta",
+            "date": date,
+            "delta_ssr_total": delta_total,
+            "delta_credits_devices": credits_devices,
+            "delta_credits_total_micro": credits_total_micro,
+            "cursor_last_ts_unix_ms": ent.last_ts_unix_ms,
+            "snapshot_sha256": snapshot_sha256,
+            "relay_base_url": relay_base
+        }));
+    }
+
+Ok(serde_json::json!({
         "ok": true,
         "exit_code": 0,
         "date": date,
