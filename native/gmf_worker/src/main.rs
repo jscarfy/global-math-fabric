@@ -1,3 +1,4 @@
+mod helper_tasks;
 use anyhow::{Context, anyhow};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::Parser;
@@ -316,7 +317,18 @@ async fn main() -> anyhow::Result<()> {
         let kind = task.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
         let result_core = match kind.as_str() {
-            "lean_check" => {
+            
+            "receipt_verify" => {
+                // Mobile helper: verify SSR signatures + digest the day ledger
+                let rc = crate::helper_tasks::run_receipt_verify(&relay_base_url, &task.params).await?;
+                rc
+            }
+            "ledger_audit" => {
+                // Mobile helper: aggregate credits + leaderboard digest for the day
+                let rc = crate::helper_tasks::run_ledger_audit(&relay_base_url, &task.params).await?;
+                rc
+            }
+"lean_check" => {
                 eprintln!("solve lean_check {task_id} …");
                 solve_lean_check(&task).unwrap_or_else(|e| serde_json::json!({
                     "ok": false,
