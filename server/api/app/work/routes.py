@@ -1,6 +1,7 @@
 GMF_AUDIT_CHUNK_SIZE = int(os.environ.get('GMF_AUDIT_CHUNK_SIZE','32768'))
 from fastapi.responses import PlainTextResponse
 from fastapi.responses import JSONResponse
+from app.auth.bearer import require_account
 import random
 import base64
 import hashlib
@@ -330,7 +331,10 @@ def pull_job(device_id: str, topics: str = ""):
         db.close()
 
 @router.post("/jobs/submit")
-def submit_job(device_id: str, lease_id: str, job_id: str, output: dict, device_msg: str = "", device_sig_b64: str = ""):
+def submit_job(device_id: str, lease_id: str, job_id: str, output: dict, device_msg: str = "", device_sig_b64: str = "", authorization: str | None = None):
+    arec, err = require_account(authorization)
+    if err: return err
+    account_id = arec['account_id']
     """
     Validate output; if accepted, mint signed work_receipt (server-signed) and write into ledger.
     Credits = job.credits if accepted else 0.
