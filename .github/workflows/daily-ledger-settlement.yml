@@ -1,0 +1,57 @@
+name: daily-ledger-settlement
+
+on:
+  schedule:
+    - cron: "10 0 * * *"   # 00:10 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  settle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Pick date (yesterday UTC)
+        id: d
+        run: |
+          DATE=$(date -u -d "yesterday" +%F)
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+
+      - name: Make settlement if inbox exists
+        env:
+          LEDGER_SERVER_SK_B64: ${{ secrets.LEDGER_SERVER_SK_B64 }}
+        run: |
+          DATE="${{ steps.d.outputs.date }}"
+          IN="ledger/inbox/${DATE}.ssr.jsonl"
+          if [ ! -f "$IN" ]; then
+            echo "No inbox for $DATE; skip."
+            exit 0
+          fi
+
+          # Find prev root from latest published settlement (if any)
+          PREV="$(ls -1 releases/ledger/*.json 2>/dev/null | sort | tail -n 1 || true)"
+          PREV_ROOT=""
+          if [ -n "$PREV" ]; then
+            PREV_ROOT="$(python3 - <<PY
+import json
+p="$PREV"
+j=json.load(open(p,'r',encoding='utf-8'))
+print(j.get("merkle_root_hex",""))
+PY
+)"
+          fi
+
+          ./scripts/ledger/make_settlement.sh "$DATE" "$LEDGER_SERVER_SK_B64" "$PREV_ROOT"
+
+      - name: Commit settlement back to main
+        run: |
+          git config user.name "gmf-bot"
+          git config user.email "gmf-bot@users.noreply.github.com"
+          git add releases/ledger/*.json || true
+          git commit -m "ledger: publish daily settlement" || true
+          git push || true
