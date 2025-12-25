@@ -1,0 +1,11 @@
+{
+  "registry_v": 1,
+  "rules": [
+    {
+      "rules_version": "v1",
+      "rules_path": "governance/rules/v1.json",
+      "sigset_path": "governance/rules/v1.sigset.guardian_set_v1.json",
+      "effective_from_checkpoint_entries": 0
+    }
+  ]
+}

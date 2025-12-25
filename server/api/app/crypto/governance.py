@@ -1,3 +1,4 @@
+from app.crypto.rules_registry import load_json as _load_json2, latest_checkpoint_entries, select_active_rules
 import json, os, base64, hashlib
 from typing import Any, Dict, Tuple, List
 
@@ -80,7 +81,8 @@ def load_governance_or_die() -> Dict[str, Any]:
         "registry_path": registry_path,
         "registry": registry,
         "sigset_guardian_set_id": sigset_guardian_set_id,
-        "rules_path": rules_path,
+        "rules_registry_path": rules_registry_path,
+"rules_path": rules_path,
         "sigset_path": sigset_path,
         "guardian_set_path": gset_path,
         "rules": rules,

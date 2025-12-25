@@ -1,0 +1,45 @@
+{
+  "audit": {
+    "heavy_proof_audit_rate": 0.01,
+    "heavy_proof_max_iters_verify": 2000000
+  },
+  "crypto_policy": {
+    "agility": "new_versions_may_add_algorithms_but_old_receipts_remain_verifiable",
+    "hash_suite": [
+      "sha256"
+    ],
+    "sig_suite": [
+      "ed25519"
+    ]
+  },
+  "invariants": {
+    "no_retroactive_changes": true,
+    "only_receipts_count": true,
+    "receipt_binds_rules_hash": true,
+    "receipt_binds_task_manifest_hash": true
+  },
+  "pricing": {
+    "antifarm": {
+      "decay_per_extra": 0.01,
+      "min_mult": 0.2,
+      "threshold": 50,
+      "window_sec": 3600
+    },
+    "base_heavy": 5,
+    "base_light": 1,
+    "max_per_instance": 200,
+    "rates": {
+      "poly_mod_per_1m": 1.5,
+      "sha256_chain_per_1m": 1.0
+    },
+    "risk_penalty_per_100": 0.5
+  },
+  "rules_version": "v2",
+  "splits": {
+    "beneficiary_pct": 0.7,
+    "default_project_id": "core",
+    "min_credits": 1,
+    "project_pct": 0.2,
+    "referrer_pct": 0.1
+  }
+}

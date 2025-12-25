@@ -25,6 +25,7 @@ from app.crypto.receipt import sign_receipt, now_iso
 from app.crypto.governance import load_governance_or_die
 from app.crypto import ledger as ledger_mod
 from app.crypto import checkpointing
+from app.crypto import amendments
 from app.crypto import merkle as merkle_mod
 from app.schemas.receipt import ReceiptEnvelope
 from app.schemas.replay import ReplayQueueResponse, ReplayQueueItem, ReplayReportRequest, ReplayReportResponse
@@ -878,6 +879,10 @@ def governance_rules_current():
         "rules": GMF_GOV["rules"],
         "sigset": GMF_GOV["sigset"],
         "guardian_set": GMF_GOV["guardian_set"],
+                "registry": GMF_GOV.get("registry", {}),
+                "transitions_dir": "governance/signers/transitions",
+                "attestations_dir": "ledger/attestations",
+
     }
 
 @app.get("/ledger/root")
@@ -1034,6 +1039,10 @@ def ledger_receipt_proof_bundle(receipt_id: str):
                 "rules": GMF_GOV["rules"],
                 "sigset": GMF_GOV["sigset"],
                 "guardian_set": GMF_GOV["guardian_set"],
+                "registry": GMF_GOV.get("registry", {}),
+                "transitions_dir": "governance/signers/transitions",
+                "attestations_dir": "ledger/attestations",
+
             },
             "inclusion": proof_obj,
         }
@@ -1135,3 +1144,32 @@ def governance_guardian_set_get(guardian_set_id: str):
         return {"ok": True, "guardian_set_id": guardian_set_id, "path": path, "guardian_set": g}
     except Exception:
         return {"ok": False, "error": "failed_to_load_guardian_set", "path": path}
+
+
+@app.get("/governance/rules/registry")
+def governance_rules_registry():
+    import json
+    path = GMF_GOV.get("rules_registry_path", "governance/rules/registry.json")
+    try:
+        return {"ok": True, "path": path, "registry": json.load(open(path, "r", encoding="utf-8"))}
+    except Exception:
+        return {"ok": False, "error": "failed_to_load_registry", "path": path}
+
+@app.get("/governance/rules/active")
+def governance_rules_active():
+    return {
+        "ok": True,
+        "rules_version": GMF_GOV.get("rules_version"),
+        "rules_sha256": GMF_GOV.get("rules_sha256"),
+        "rules_path": GMF_GOV.get("rules_path"),
+        "sigset_guardian_set_id": GMF_GOV.get("sigset_guardian_set_id"),
+        "head_checkpoint_entries": __import__("app.crypto.rules_registry").crypto.rules_registry.latest_checkpoint_entries()
+    }
+
+@app.post("/governance/rules/amendments/submit")
+def governance_rules_amendments_submit(amendment: dict):
+    """
+    Accept a threshold-signed rules amendment, store it, and append to rules registry.
+    """
+    res = amendments.apply_amendment(amendment)
+    return {"ok": True, **res}
