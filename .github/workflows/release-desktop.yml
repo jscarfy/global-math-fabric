@@ -1,0 +1,95 @@
+name: release-desktop
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 'stable'
+      - run: |
+          cd clients/gmf_mobile_flutter
+          flutter pub get
+          flutter build linux --release
+          mkdir -p ../../dist/updates
+          tar -czf ../../dist/updates/gmf-linux-x64.tar.gz -C build/linux/x64/release/bundle .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/updates/gmf-linux-x64.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 'stable'
+      - run: |
+          cd clients/gmf_mobile_flutter
+          flutter pub get
+          flutter build windows --release
+          cd build/windows/x64/runner/Release
+          powershell -Command "Compress-Archive -Path * -DestinationPath ../../../../../../../../dist/updates/gmf-windows-x64.zip -Force"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/updates/gmf-windows-x64.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 'stable'
+      - run: |
+          cd clients/gmf_mobile_flutter
+          flutter pub get
+          flutter build macos --release
+          mkdir -p ../../dist/updates
+          ditto -c -k --sequesterRsrc --keepParent build/macos/Build/Products/Release/*.app ../../dist/updates/gmf-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/updates/gmf-macos.zip
+
+  publish:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/updates
+
+      - name: Create GitHub Release + upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" -t "$TAG" -n "GMF desktop release $TAG"
+          find dist/updates -type f -maxdepth 2 -print -exec gh release upload "$TAG" {} --clobber \;
+
+      - name: Generate appcast.xml (Sparkle tool if present, else keep existing)
+        run: |
+          mkdir -p releases
+          if [ -x tools/sparkle/bin/generate_appcast ]; then
+            ./scripts/release/generate_appcast_sparkle.sh dist/updates releases/appcast.xml
+          else
+            echo "No Sparkle generate_appcast; keeping releases/appcast.xml as-is"
+          fi
+
+      - name: Commit appcast.xml back to repo
+        run: |
+          git config user.name "gmf-bot"
+          git config user.email "gmf-bot@users.noreply.github.com"
+          git add releases/appcast.xml || true
+          git commit -m "release: update appcast.xml for ${GITHUB_REF_NAME}" || true
+          git push || true
