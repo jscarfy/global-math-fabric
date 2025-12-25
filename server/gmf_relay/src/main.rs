@@ -1017,6 +1017,41 @@ async fn main() -> anyhow::Result<()> {
             sleep(Duration::from_secs(snap_interval_secs)).await;
         }
     });
+    // finalize yesterday (UTC) once inbox has been quiet for grace seconds
+    let finalize_grace_secs: u64 = env::var("GMF_FINALIZE_GRACE_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(600);
+    let finalize_interval_secs: u64 = env::var("GMF_FINALIZE_INTERVAL_SECS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(60);
+
+    let server_pubkey_b64_str2 = server_pubkey_b64_str.clone();
+    let server_sign_fn2 = server_sign_fn.clone();
+
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        loop {
+            let now = Utc::now();
+            let y = now - chrono::Duration::days(1);
+            let date = format!("{:04}-{:02}-{:02}", y.year(), y.month(), y.day());
+
+            let inbox = inbox_path(&date);
+            let finalp = final_snapshot_path(&date);
+
+            if inbox.exists() && !finalp.exists() {
+                if let Ok(md) = std::fs::metadata(&inbox) {
+                    if let Ok(mtime) = md.modified() {
+                        if let Ok(elapsed) = mtime.elapsed() {
+                            if elapsed.as_secs() >= finalize_grace_secs {
+                                let _ = write_final_snapshot_once(&date, &server_pubkey_b64_str2, server_sign_fn2.as_ref());
+                            }
+                        }
+                    }
+                }
+            }
+
+            sleep(Duration::from_secs(finalize_interval_secs)).await;
+        }
+    });
+
 
     let app = Router::new()
         .route("/health", get(health))
