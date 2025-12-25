@@ -41,4 +41,7 @@ curl -fsS "${RELAY}/v1/audit/final/${DATE}" > "ledger/audit/${DATE}.audit_final.
 
 ./tools/audit/export_audit_points.py "${DATE}"
 
+# 4.9) write canonical_totals.json for multi-day reports
+./tools/reports/write_canonical_totals.py "${DATE}"
+
 echo "OK: settled ${DATE} using immutable final snapshot anchor."
