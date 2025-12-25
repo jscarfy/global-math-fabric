@@ -26,3 +26,11 @@ yarn-error.log*
 *.log
 governance/vault/
 keys/*.priv.pem
+
+# --- NEVER COMMIT SECRETS ---
+governance/vault/
+keys/*.priv.pem
+**/*.priv.pem
+*.key
+*.p12
+*.pfx
