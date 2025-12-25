@@ -25,9 +25,6 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     only_while_charging: bool,
-
-    #[arg(long, default_value = "leanprovercommunity/lean:latest")]
-    lean_image: String,
 }
 
 fn key_dir() -> PathBuf { dirs::home_dir().unwrap().join(".gmf") }
@@ -86,15 +83,20 @@ fn run_cmd(mut cmd: Command) -> anyhow::Result<(i32, String)> {
     Ok((code, s))
 }
 
-fn solve_lean_check(task: &Value, lean_image: &str) -> anyhow::Result<(bool, i32)> {
+/// Docker script writes /workspace/.gmf_result_core.json
+fn solve_lean_check(task: &Value) -> anyhow::Result<Value> {
     let params = task.get("params").context("missing params")?;
     let git_url = params.get("git_url").and_then(|v| v.as_str()).context("missing git_url")?;
     let rev = params.get("rev").and_then(|v| v.as_str()).context("missing rev")?;
     let subdir = params.get("subdir").and_then(|v| v.as_str()).unwrap_or("");
     let use_cache = params.get("use_mathlib_cache").and_then(|v| v.as_bool()).unwrap_or(true);
+    let artifacts_root = params.get("artifacts_root").and_then(|v| v.as_str()).unwrap_or(".lake/build/lib");
+    let docker_image = params.get("docker_image").and_then(|v| v.as_str()).unwrap_or("leanprovercommunity/lean:latest");
 
-    // cmd defaults to ["lake","build"]
-    let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned().unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
+    let require_artifact_hash = params.get("require_artifact_hash").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let cmd_arr = params.get("cmd").and_then(|v| v.as_array()).cloned()
+        .unwrap_or_else(|| vec![Value::String("lake".into()), Value::String("build".into())]);
     let cmd_vec: Vec<String> = cmd_arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
     if cmd_vec.is_empty() { return Err(anyhow!("empty cmd")); }
 
@@ -103,7 +105,6 @@ fn solve_lean_check(task: &Value, lean_image: &str) -> anyhow::Result<(bool, i32
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo)?;
 
-    // minimal fetch of specific commit
     run_cmd(Command::new("git").arg("init").current_dir(&repo))?;
     run_cmd(Command::new("git").args(["remote","add","origin", git_url]).current_dir(&repo))?;
     run_cmd(Command::new("git").args(["fetch","--depth","1","origin", rev]).current_dir(&repo))?;
@@ -114,26 +115,86 @@ fn solve_lean_check(task: &Value, lean_image: &str) -> anyhow::Result<(bool, i32
         return Err(anyhow!("subdir does not exist: {}", workdir.display()));
     }
 
-    // build command inside Docker
-    // - mount repo, run in /workspace/<subdir>
-    // - optionally run lake exe cache get first (mathlib speed)
-    let mut bash = String::new();
-    if use_cache {
-        bash.push_str("lake exe cache get && ");
-    }
-    bash.push_str(&cmd_vec.join(" "));
+    // Build inside docker:
+    // - capture all output to /workspace/.gmf_build.log
+    // - compute build_log_sha256
+    // - compute artifacts manifest + sha (if require_artifact_hash)
+    // - write result_core JSON to /workspace/.gmf_result_core.json
+    let bash = format!(r#"
+set +e
+cd /workspace/{subdir}
+LOG="/workspace/.gmf_build.log"
+RES="/workspace/.gmf_result_core.json"
+ARTROOT="/workspace/{subdir}/{artifacts_root}"
 
-    // docker run
-    let (code, _log) = run_cmd(
+( {"cache_cmd"} {cmd} ) >"$LOG" 2>&1
+RC=$?
+
+# build log hash
+BLH=$(sha256sum "$LOG" | awk '{{print $1}}')
+
+OK=false
+if [ "$RC" -eq 0 ]; then OK=true; fi
+
+ART_COUNT=0
+ART_MANIFEST_SHA=""
+if {require_hash}; then
+  if [ -d "$ARTROOT" ]; then
+    # manifest sorted by path, format: "<sha>  <relpath>"
+    MAN="/workspace/.gmf_artifacts.manifest"
+    (cd "$ARTROOT" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$MAN"
+    ART_COUNT=$(wc -l < "$MAN" | tr -d ' ')
+    ART_MANIFEST_SHA=$(sha256sum "$MAN" | awk '{{print $1}}')
+  else
+    # required but missing => fail deterministic hash
+    OK=false
+    RC=2
+    ART_COUNT=0
+    ART_MANIFEST_SHA=""
+  fi
+fi
+
+cat > "$RES" <<EOF
+{{"ok":$OK,"exit_code":$RC,"build_log_sha256":"$BLH","artifacts_root":"{artifacts_root}","artifacts_count":$ART_COUNT,"artifacts_manifest_sha256":"$ART_MANIFEST_SHA","docker_image":"{docker_image}"}}
+EOF
+
+exit 0
+"#,
+        subdir=subdir,
+        artifacts_root=artifacts_root,
+        docker_image=docker_image,
+        cmd=cmd_vec.join(" "),
+        cache_cmd= if use_cache { "lake exe cache get &&" } else { "" },
+        require_hash= if require_artifact_hash { "true" } else { "false" },
+    );
+
+    // run docker
+    let (code, log) = run_cmd(
         Command::new("docker")
             .arg("run").arg("--rm")
             .arg("-v").arg(format!("{}:/workspace", repo.display()))
-            .arg("-w").arg(format!("/workspace/{}", subdir))
-            .arg(lean_image)
+            .arg("-w").arg("/workspace")
+            .arg(docker_image)
             .arg("bash").arg("-lc").arg(bash)
     )?;
+    if code != 0 {
+        // docker itself failed
+        return Ok(serde_json::json!({
+            "ok": false,
+            "exit_code": 127,
+            "build_log_sha256": hex::encode(sha256(log.as_bytes())),
+            "artifacts_root": artifacts_root,
+            "artifacts_count": 0,
+            "artifacts_manifest_sha256": "",
+            "docker_image": docker_image
+        }));
+    }
 
-    Ok((code == 0, code))
+    // read result_core from repo root
+    let result_path = repo.join(".gmf_result_core.json");
+    let txt = fs::read_to_string(&result_path).context("missing .gmf_result_core.json")?;
+    let v: Value = serde_json::from_str(&txt).context("bad result_core json")?;
+    Ok(v)
 }
 
 #[tokio::main]
@@ -145,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
     let device_id = device_id_from_pubkey_b64(&pub_b64)?;
     eprintln!("GMF worker device_id={device_id}");
 
-    // consent token JSON string (device signed)
+    // consent token (device signed)
     let caps = serde_json::json!({
         "max_cpu_percent": args.max_cpu_percent,
         "wifi_only": args.wifi_only,
@@ -176,8 +237,7 @@ async fn main() -> anyhow::Result<()> {
 
         let pull_json: Value = match pull_res {
             Ok(r) if r.status().is_success() => r.json().await.unwrap_or(Value::Null),
-            Ok(_) => { thread::sleep(Duration::from_secs(args.loop_seconds)); continue; }
-            Err(_) => { thread::sleep(Duration::from_secs(args.loop_seconds)); continue; }
+            _ => { thread::sleep(Duration::from_secs(args.loop_seconds)); continue; }
         };
 
         let task = pull_json.get("task").cloned().unwrap_or(Value::Null);
@@ -190,11 +250,18 @@ async fn main() -> anyhow::Result<()> {
         let task_id = task.get("task_id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let kind = task.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
 
-        // solve -> result_core must be deterministic-ish; keep minimal fields
-        let (ok, exit_code) = match kind.as_str() {
+        let result_core = match kind.as_str() {
             "lean_check" => {
                 eprintln!("solve lean_check {task_id} …");
-                solve_lean_check(&task, &args.lean_image).unwrap_or((false, 1))
+                solve_lean_check(&task).unwrap_or_else(|e| serde_json::json!({
+                    "ok": false,
+                    "exit_code": 1,
+                    "build_log_sha256": hex::encode(sha256(e.to_string().as_bytes())),
+                    "artifacts_root": ".lake/build/lib",
+                    "artifacts_count": 0,
+                    "artifacts_manifest_sha256": "",
+                    "docker_image": "unknown"
+                }))
             }
             _ => {
                 eprintln!("unknown kind={kind}; skipping");
@@ -203,9 +270,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        let result_core = serde_json::json!({ "ok": ok, "exit_code": exit_code });
-
-        // submit
+        // submit (result_core is now rich + hash-based)
         let submit_payload = serde_json::json!({
             "task_id": task_id,
             "result_core": result_core,
@@ -227,7 +292,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(r) if r.status().is_success() => {
                 let ssr: Value = r.json().await.unwrap_or(Value::Null);
                 let delta = ssr.pointer("/receipt_payload/credits_delta_micro").and_then(|x| x.as_i64()).unwrap_or(0);
-                eprintln!("SSR ok: +{delta} microcredits");
+                let fraud = ssr.pointer("/receipt_payload/fraud_flag").and_then(|x| x.as_bool()).unwrap_or(false);
+                eprintln!("SSR ok: delta={delta} fraud={fraud}");
             }
             Ok(r) => {
                 let t = r.text().await.unwrap_or_default();
