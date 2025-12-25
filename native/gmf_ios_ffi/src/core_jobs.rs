@@ -1,9 +1,12 @@
+mod rw_eq_v1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind")]
 pub enum JobInput {
+    #[serde(rename="rw_eq_v1")]
+    RwEqV1 { theory: String, start: rw_eq_v1::Expr, goal: rw_eq_v1::Expr, max_steps: u32, max_nodes: u32 },
     #[serde(rename="pow_v1")]
     PowV1 { seed_hex: String, difficulty: u32 },
 
@@ -144,6 +147,22 @@ pub fn run_job_json(input_json: &str) -> JobOutput {
                 Err(msg) => JobOutput::Error{ message: msg },
             }
         }
+        Ok(JobInput::RwEqV1{theory, start, goal, max_steps, max_nodes}) => {
+            if theory != "ring_lite_v1" {
+                return JobOutput::Error{ message: "unsupported theory".to_string() };
+            }
+            match rw_eq_v1::solve_rw_eq_v1(start, goal, max_steps, max_nodes) {
+                rw_eq_v1::Output::Ok{ok, final_, steps, stats} => {
+                    // emit as JSON inside output string (outer layer JobOutput keeps compatibility)
+                    let obj = serde_json::json!({"kind":"rw_eq_v1_result","ok":ok,"final":final_,"steps":steps,"stats":stats});
+                    return JobOutput::Error{ message: obj.to_string() };
+                }
+                rw_eq_v1::Output::Err{message} => {
+                    return JobOutput::Error{ message };
+                }
+            }
+        }
+
         Ok(JobInput::PolyIdentityV1{vars, lhs, rhs}) => {
             match poly_identity(&vars, &lhs, &rhs) {
                 Ok(o) => o,
