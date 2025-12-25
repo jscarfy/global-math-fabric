@@ -15,6 +15,7 @@ jobs:
         run: |
           mkdir -p _pages/releases
           cp -rf releases/. _pages/releases/ || true
+          cp -f releases/index.html _pages/index.html || true
           mkdir -p _pages/releases/windows
           cp -rf releases/windows/. _pages/releases/windows/ || true
 
