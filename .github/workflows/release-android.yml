@@ -1,63 +1,102 @@
 name: release-android
 
 on:
+  pull_request:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
 
+# PR 只需要讀 repo；release 才需要寫 contents
+permissions:
+  contents: read
+
 jobs:
-  android:
+  pr-build:
+    name: PR Build (debug, no secrets)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 如果是 Flutter 專案：打開下面 flutter-action；若不是 Flutter，刪掉即可
+      - uses: subosito/flutter-action@v2
         with:
-          fetch-depth: 0
+          flutter-version: "stable"
+          cache: true
+
+      # ✅ 你需要把 working-directory 改成你實際 app 目錄：
+      #   - Flutter root: client/gmf_control_panel 或 ios/android 同層
+      #   - 純 Android: android/
+      - name: Flutter pub get
+        run: flutter pub get
+        working-directory: client/gmf_control_panel
+
+      - name: Build debug apk (no signing)
+        run: flutter build apk --debug
+        working-directory: client/gmf_control_panel
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: client/gmf_control_panel/build/app/outputs/flutter-apk/app-debug.apk
+
+  release:
+    name: Release (signed)
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: "stable"
+          cache: true
 
-      - name: Decode Android keystore (from secrets)
-        shell: bash
+      # ---- Decode signing materials (ONLY on release path) ----
+      # 需要在 repo Settings -> Secrets and variables -> Actions 加：
+      # ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+      - name: Decode Android keystore
+        run: |
+          mkdir -p android/app/keystore
+          echo "${ANDROID_KEYSTORE_B64}" | base64 -d > android/app/keystore/release.jks
         env:
           ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        working-directory: client/gmf_control_panel
+
+      - name: Write key.properties
+        run: |
+          cat > android/key.properties <<EOF
+          storePassword=${ANDROID_KEYSTORE_PASSWORD}
+          keyPassword=${ANDROID_KEY_PASSWORD}
+          keyAlias=${ANDROID_KEY_ALIAS}
+          storeFile=app/keystore/release.jks
+          EOF
+        env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          cd clients/gmf_mobile_flutter
-          mkdir -p android/app/keystore
-          echo "$ANDROID_KEYSTORE_B64" | base64 -d > android/app/keystore/upload-keystore.jks
+        working-directory: client/gmf_control_panel
 
-          cat > android/key.properties <<EOF
-storePassword=$ANDROID_KEYSTORE_PASSWORD
-keyPassword=$ANDROID_KEY_PASSWORD
-keyAlias=$ANDROID_KEY_ALIAS
-storeFile=app/keystore/upload-keystore.jks
-EOF
+      - name: Flutter pub get
+        run: flutter pub get
+        working-directory: client/gmf_control_panel
 
-      - name: Build signed release APK
-        shell: bash
-        run: |
-          cd clients/gmf_mobile_flutter
-          flutter pub get
-          flutter build apk --release
-          ls -lh build/app/outputs/flutter-apk/app-release.apk
+      # 你可以選擇 apk / appbundle
+      - name: Build release APK (signed)
+        run: flutter build apk --release
+        working-directory: client/gmf_control_panel
 
-      - name: Stage APK into releases/android + sha256
-        shell: bash
-        run: |
-          cd /home/runner/work/${{ github.event.repository.name }}/${{ github.event.repository.name }}
-          mkdir -p releases/android
-          cp -f clients/gmf_mobile_flutter/build/app/outputs/flutter-apk/app-release.apk releases/android/latest.apk
-          ./scripts/release/sha256_file.sh releases/android/latest.apk releases/android/latest.apk.sha256
-          ls -lh releases/android/latest.apk releases/android/latest.apk.sha256
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: client/gmf_control_panel/build/app/outputs/flutter-apk/app-release.apk
 
-      - name: Commit APK back to main (for GitHub Pages)
-        shell: bash
-        run: |
-          git config user.name "gmf-bot"
-          git config user.email "gmf-bot@users.noreply.github.com"
-          git add releases/android/latest.apk releases/android/latest.apk.sha256
-          git commit -m "release: publish android latest.apk for ${GITHUB_REF_NAME}" || true
-          git push origin HEAD:main || true
+      - name: Create GitHub Release (attach APK)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: client/gmf_control_panel/build/app/outputs/flutter-apk/app-release.apk
