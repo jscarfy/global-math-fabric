@@ -1,3 +1,5 @@
+mod policy;
+
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use rand::rngs::OsRng;
@@ -34,6 +36,8 @@ enum Cmd {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct AgentConfig {
+    policy: policy::RunPolicy,
+
     relay: String,
     device_name: String,
     device_id: String,
@@ -89,6 +93,7 @@ async fn main() -> Result<()> {
                 device_pubkey_b64: b64(vk.as_bytes()),
                 device_seckey_b64: b64(sk.as_bytes()),
                 consent_token_json: None,
+                policy: policy::RunPolicy::default(),
             };
             save_cfg(&cfg)?;
             println!("OK: wrote {}", cfg_path()?.display());
@@ -126,15 +131,23 @@ async fn main() -> Result<()> {
 
             // Delegate to existing gmf_worker binary for now (simple+robust)
             // You can later link worker as a library; this is the minimal “friend can run” path.
-            println!("Running agent loop against relay={} every {}s", cfg.relay, loop_seconds);
+            let loop_s = loop_seconds.max(cfg.policy.min_loop_seconds);
+            println!("Running agent loop against relay={} every {}s", cfg.relay, loop_s);
 
             loop {
+                let cfg2 = load_cfg()?;
+                if !policy::policy_allows_run(&cfg2.policy) {
+                    eprintln!("[agent] policy pause (paused/quiet-hours/power/battery). sleeping {}s", loop_seconds);
+                    tokio::time::sleep(Duration::from_secs(loop_seconds.max(cfg2.policy.min_loop_seconds))).await;
+                    continue;
+                }
+
                 // Call gmf_worker in helper mode by env + args (assumes built)
                 // On friends' machines: ship prebuilt gmf_worker + gmf_agent; or build from source.
                 let st = std::process::Command::new("native/target/release/gmf_worker")
                     .env("GMF_CAPABILITIES", "helper")
                     .arg("--relay").arg(&cfg.relay)
-                    .arg("--loop-seconds").arg(loop_seconds.to_string())
+                    .arg("--loop-seconds").arg(loop_s.to_string())
                     .status();
 
                 match st {
