@@ -1,0 +1,66 @@
+name: release-binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build gmf_agent + gmf_worker
+        run: |
+          cargo build --manifest-path native/Cargo.toml -p gmf_agent -p gmf_worker --release
+
+      - name: Determine os/arch + rename assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="${{ runner.os }}"
+          case "$OS" in
+            Linux)   OSN="linux" ;;
+            macOS)   OSN="macos" ;;
+            Windows) OSN="windows" ;;
+            *) echo "unknown OS=$OS"; exit 2 ;;
+          esac
+
+          if [[ "$OSN" == "windows" ]]; then
+            ARCH="$(uname -m | tr '[:upper:]' '[:lower:]')"
+          else
+            ARCH="$(uname -m | tr '[:upper:]' '[:lower:]')"
+          fi
+          case "$ARCH" in
+            x86_64|amd64) ARCHN="x86_64" ;;
+            aarch64|arm64) ARCHN="arm64" ;;
+            *) echo "unknown arch=$ARCH"; exit 2 ;;
+          esac
+
+          mkdir -p dist
+
+          if [[ "$OSN" == "windows" ]]; then
+            cp native/target/release/gmf_agent.exe "dist/gmf_agent-${OSN}-${ARCHN}.exe"
+            cp native/target/release/gmf_worker.exe "dist/gmf_worker-${OSN}-${ARCHN}.exe"
+          else
+            cp native/target/release/gmf_agent "dist/gmf_agent-${OSN}-${ARCHN}"
+            cp native/target/release/gmf_worker "dist/gmf_worker-${OSN}-${ARCHN}"
+          fi
+
+          (cd dist && shasum -a 256 * 2>/dev/null || true)
+          (cd dist && sha256sum * 2>/dev/null || true)
+
+      - name: Create GitHub Release + upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
