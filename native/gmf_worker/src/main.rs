@@ -446,6 +446,40 @@ async fn main() -> anyhow::Result<()> {
 
                 rc
             }
+
+            "export_audit_final_verify" => {
+                let rc = crate::helper_tasks::run_export_audit_final_verify(&relay_base_url, &task.params).await?;
+
+                // meta-attest export_audit_final (best-effort) if ok
+                let do_meta = task.params.get("meta_attest").and_then(|v| v.as_bool()).unwrap_or(true);
+                if do_meta {
+                    let ok = rc.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if ok {
+                        let rk = rc.get("report_kind").and_then(|v| v.as_str()).unwrap_or("");
+                        let pid = rc.get("period_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let anchor_sha = rc.get("export_audit_log_sha256_expected").and_then(|v| v.as_str()).unwrap_or("");
+
+                        let payload = serde_json::json!({
+                            "date": pid,
+                            "target_kind": "export_audit_final",
+                            "target_anchor_sha256": anchor_sha,
+                            "report_kind": rk,
+                            "period_id": pid,
+                            "verifier_result_ok": true,
+                            "verifier_detail": rc
+                        });
+                        let body = serde_json::json!({
+                            "consent_token_json": consent_token_json,
+                            "device_pubkey_b64": device_pubkey_b64,
+                            "meta_audit_payload": payload
+                        });
+                        let url = format!("{}/v1/meta_audit/attest", relay_base_url.trim_end_matches('/'));
+                        let _ = reqwest::Client::new().post(&url).json(&body).send().await;
+                    }
+                }
+
+                rc
+            }
 "final_verify" => {
                 let rc = crate::helper_tasks::run_final_verify(&relay_base_url, &task.params).await?;
 
