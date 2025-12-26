@@ -1,9 +1,13 @@
 name: release-android-play
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   android:
