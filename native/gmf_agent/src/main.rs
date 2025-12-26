@@ -32,6 +32,33 @@ enum Cmd {
     },
     /// show config status
     Status,
+
+
+    /// pause agent (sets policy.paused=true)
+    Pause,
+
+    /// resume agent (sets policy.paused=false)
+    Resume,
+
+    /// update run policy (writes into ~/.gmf_agent/config.json)
+    SetPolicy {
+        /// only run when on AC power (best-effort detection); default true
+        #[arg(long)]
+        only_on_ac: Option<bool>,
+
+        /// minimum battery percent (best-effort); default 30
+        #[arg(long)]
+        min_battery: Option<u8>,
+
+        /// minimum loop seconds; default 5
+        #[arg(long)]
+        min_loop_seconds: Option<u64>,
+
+        /// quiet hours: "23-7" (wrap allowed). Use "off" to disable.
+        #[arg(long)]
+        quiet: Option<String>,
+    },
+
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -68,6 +95,23 @@ fn load_cfg() -> Result<AgentConfig> {
     let txt = fs::read_to_string(&p)
         .map_err(|_| anyhow!("missing config: run `gmf_agent init` first: {}", p.display()))?;
     Ok(serde_json::from_str(&txt)?)
+}
+
+
+fn parse_quiet_arg(q: &str) -> Result<Option<(u8,u8,bool)>> {
+    let q = q.trim().to_lowercase();
+    if q == "off" || q == "disable" || q == "disabled" {
+        return Ok(Some((23,7,false)));
+    }
+    // format "H1-H2"
+    let parts: Vec<_> = q.split('-').collect();
+    if parts.len() != 2 { return Err(anyhow!("quiet must be like 23-7 or 'off'")); }
+    let a: u8 = parts[0].parse().map_err(|_| anyhow!("bad quiet start hour"))?;
+    let b: u8 = parts[1].parse().map_err(|_| anyhow!("bad quiet end hour"))?;
+    if a > 23 || b > 23 {  # will be replaced below
+        return Err(anyhow!("quiet hours must be 0..23"));
+    }
+    Ok(Some((a,b,true)))
 }
 
 fn random_device_id() -> String {
@@ -118,6 +162,36 @@ async fn main() -> Result<()> {
             cfg.consent_token_json = Some(token);
             save_cfg(&cfg)?;
             println!("OK: enrolled; consent token saved.");
+        }
+
+
+        Cmd::Pause => {
+            let mut cfg = load_cfg()?;
+            cfg.policy.paused = true;
+            save_cfg(&cfg)?;
+            println!("OK: paused (policy.paused=true)");
+        }
+        Cmd::Resume => {
+            let mut cfg = load_cfg()?;
+            cfg.policy.paused = false;
+            save_cfg(&cfg)?;
+            println!("OK: resumed (policy.paused=false)");
+        }
+        Cmd::SetPolicy { only_on_ac, min_battery, min_loop_seconds, quiet } => {
+            let mut cfg = load_cfg()?;
+            if let Some(v) = only_on_ac { cfg.policy.only_when_on_ac_power = v; }
+            if let Some(v) = min_battery { cfg.policy.min_battery_percent = v; }
+            if let Some(v) = min_loop_seconds { cfg.policy.min_loop_seconds = v; }
+            if let Some(q) = quiet {
+                if let Some((a,b,en)) = parse_quiet_arg(&q)? {
+                    cfg.policy.quiet_hours.start_hour = a;
+                    cfg.policy.quiet_hours.end_hour = b;
+                    cfg.policy.quiet_hours.enabled = en;
+                }
+            }
+            save_cfg(&cfg)?;
+            println!("OK: policy updated");
+            println!("{}", serde_json::to_string_pretty(&cfg.policy)?);
         }
 
         Cmd::Status => {
