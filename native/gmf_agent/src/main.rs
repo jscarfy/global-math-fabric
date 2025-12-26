@@ -33,6 +33,9 @@ enum Cmd {
     /// show config status
     Status,
 
+    /// machine-readable status (json)
+    StatusJson,
+
 
     /// pause agent (sets policy.paused=true)
     Pause,
@@ -79,6 +82,32 @@ fn cfg_dir() -> Result<PathBuf> {
     Ok(d)
 }
 fn cfg_path() -> Result<PathBuf> { Ok(cfg_dir()?.join("config.json")) }
+
+
+fn state_path() -> Result<PathBuf> { Ok(cfg_dir()?.join("state.json")) }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+struct AgentState {
+    running: bool,
+    worker_pid: Option<u32>,
+    last_start_unix_ms: Option<i64>,
+    last_stop_unix_ms: Option<i64>,
+    last_error: Option<String>,
+    last_policy_block_reason: Option<String>,
+}
+
+fn save_state(st: &AgentState) -> Result<()> {
+    std::fs::create_dir_all(cfg_dir()?)?;
+    std::fs::write(state_path()?, serde_json::to_vec_pretty(st)?)?;
+    Ok(())
+}
+fn load_state() -> Result<AgentState> {
+    let p = state_path()?;
+    if !p.exists() { return Ok(AgentState::default()); }
+    let txt = std::fs::read_to_string(&p)?;
+    Ok(serde_json::from_str(&txt)?)
+}
+
 
 fn b64(b: &[u8]) -> String { base64::engine::general_purpose::STANDARD.encode(b) }
 fn b64d(s: &str) -> Result<Vec<u8>> {
@@ -192,6 +221,17 @@ async fn main() -> Result<()> {
             save_cfg(&cfg)?;
             println!("OK: policy updated");
             println!("{}", serde_json::to_string_pretty(&cfg.policy)?);
+        }
+
+
+        Cmd::StatusJson => {
+            let cfg = load_cfg()?;
+            let st = load_state().unwrap_or_default();
+            let out = serde_json::json!({
+                "config": cfg,
+                "state": st
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
         }
 
         Cmd::Status => {
