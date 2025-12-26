@@ -36,6 +36,10 @@ enum Cmd {
     /// machine-readable status (json)
     StatusJson,
 
+    /// sum local receipts.jsonl minted credits (v1)
+    Credits,
+
+
 
     /// pause agent (sets policy.paused=true)
     Pause,
@@ -85,6 +89,8 @@ fn cfg_path() -> Result<PathBuf> { Ok(cfg_dir()?.join("config.json")) }
 
 
 fn state_path() -> Result<PathBuf> { Ok(cfg_dir()?.join("state.json")) }
+fn receipts_path() -> Result<PathBuf> { Ok(cfg_dir()?.join("receipts.jsonl")) }
+
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct AgentState {
@@ -223,6 +229,34 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&cfg.policy)?);
         }
 
+
+
+        Cmd::Credits => {
+            let rp = receipts_path()?;
+            if !rp.exists() {
+                println!("0");
+                eprintln!("No receipts found at {}. (v1 expects you to store server-signed receipts locally.)", rp.display());
+                eprintln!("Next step: wire worker/relay to append accepted receipts into receipts.jsonl.");
+                return Ok(());
+            }
+            let txt = std::fs::read_to_string(&rp)?;
+            let mut total: i128 = 0;
+            let mut lines = 0;
+            for line in txt.lines() {
+                if line.trim().is_empty() { continue; }
+                lines += 1;
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    // Look for minted_credit_micro anywhere in payload (best-effort)
+                    let mc = v.pointer("/minted_credit_micro").and_then(|x| x.as_i64())
+                        .or_else(|| v.pointer("/receipt_payload/minted_credit_micro").and_then(|x| x.as_i64()))
+                        .or_else(|| v.pointer("/meta_audit_payload/minted_credit_micro").and_then(|x| x.as_i64()))
+                        .or_else(|| v.pointer("/export_audit_payload/minted_credit_micro").and_then(|x| x.as_i64()));
+                    if let Some(x) = mc { total += x as i128; }
+                }
+            }
+            println!("{}", total);
+            eprintln!("(summed from {} lines in {})", lines, rp.display());
+        }
 
         Cmd::StatusJson => {
             let cfg = load_cfg()?;
