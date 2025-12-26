@@ -715,3 +715,66 @@ pub async fn run_canonical_export_verify(relay_base: &str, params: &Value) -> Re
         "rollup_matches": roll_ok
     }))
 }
+
+
+pub async fn run_export_audit_final_verify(relay_base: &str, params: &Value) -> Result<Value> {
+    let rk = params.get("report_kind").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing report_kind"))?;
+    let pid = params.get("period_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing period_id"))?;
+    let base = relay_base.trim_end_matches('/');
+
+    let (final_url, log_url) = if rk == "monthly" {
+        (format!("{}/v1/export_audit/final/monthly/{}", base, pid),
+         format!("{}/v1/export_audit/log/monthly/{}", base, pid))
+    } else if rk == "yearly" {
+        (format!("{}/v1/export_audit/final/yearly/{}", base, pid),
+         format!("{}/v1/export_audit/log/yearly/{}", base, pid))
+    } else {
+        return Err(anyhow!("bad report_kind"));
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(PAGE_TIMEOUT_SECS))
+        .build()?;
+
+    // fetch final
+    let r1 = client.get(&final_url).send().await?;
+    if !r1.status().is_success() { return Err(anyhow!("export_audit_final fetch failed: {}", r1.status())); }
+    let txt_final = r1.text().await?;
+    let env_final: serde_json::Value = serde_json::from_str(&txt_final)?;
+
+    // fetch log
+    let r2 = client.get(&log_url).send().await?;
+    if !r2.status().is_success() { return Err(anyhow!("export_audit log fetch failed: {}", r2.status())); }
+    let log_bytes = r2.bytes().await?.to_vec();
+
+    // verify final signature (server-signed payload)
+    let payload = env_final.get("export_audit_final_payload").ok_or_else(|| anyhow!("missing export_audit_final_payload"))?;
+    let pk_b64 = env_final.get("server_pubkey_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_pubkey_b64"))?;
+    let sig_b64 = env_final.get("server_sig_b64").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing server_sig_b64"))?;
+
+    let pk_bytes = B64.decode(pk_b64)?;
+    let pk = VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| anyhow!("bad pk bytes"))?)
+        .map_err(|_| anyhow!("bad pk"))?;
+    let sig_bytes = B64.decode(sig_b64)?;
+    let sig = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| anyhow!("bad sig bytes"))?);
+
+    let canon = canonical_json_bytes_local(payload);
+    let msg = Sha256::digest(&canon);
+    let sig_ok = pk.verify(&msg, &sig).is_ok();
+
+    // verify log sha matches payload
+    let got_log_sha = hex::encode(Sha256::digest(&log_bytes));
+    let exp_log_sha = payload.get("export_audit_log_sha256").and_then(|v| v.as_str()).unwrap_or("");
+    let sha_ok = exp_log_sha == got_log_sha;
+
+    Ok(serde_json::json!({
+        "ok": sig_ok && sha_ok,
+        "exit_code": if sig_ok && sha_ok { 0 } else { 2 },
+        "report_kind": rk,
+        "period_id": pid,
+        "sig_ok": sig_ok,
+        "export_audit_log_sha256_expected": exp_log_sha,
+        "export_audit_log_sha256_got": got_log_sha,
+        "log_sha_matches": sha_ok
+    }))
+}
